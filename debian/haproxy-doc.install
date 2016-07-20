@@ -1,0 +1,2 @@
+doc/configuration.html usr/share/doc/haproxy-doc/html/
+debian/dconv/static/* usr/share/doc/haproxy-doc/html/static/
