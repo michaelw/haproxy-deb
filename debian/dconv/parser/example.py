@@ -6,18 +6,18 @@ class Parser(parser.Parser):
     def __init__(self, pctxt):
         parser.Parser.__init__(self, pctxt)
         template = pctxt.templates.get_template("parser/example/comment.tpl")
-        self.comment = template.render().strip()
+        self.comment = template.render(pctxt=pctxt).strip()
 
 
     def parse(self, line):
         pctxt = self.pctxt
 
-        result = re.search(r'(Examples? *:)', line)
+        result = re.search(r'^ *(Examples? *:)(.*)', line)
         if result:
-            label = result.group(0)
+            label = result.group(1)
 
             desc_indent = False
-            desc = re.sub(r'.*Examples? *:', '', line).strip()
+            desc = result.group(2).strip()
 
             # Some examples have a description
             if desc:
@@ -52,12 +52,13 @@ class Parser(parser.Parser):
                     pctxt.next()
             elif parser.get_indent(pctxt.get_line()) == indent:
                 # Simple example that can't have empty lines
-                if add_empty_line:
+                if add_empty_line and desc:
                     # This means that the example was on the same line as the 'Example' tag
+                    # and was not a description
                     content.append(" " * indent + desc)
                     desc = False
                 else:
-                    while pctxt.has_more_lines() and (parser.get_indent(pctxt.get_line()) == indent):
+                    while pctxt.has_more_lines() and (parser.get_indent(pctxt.get_line()) >= indent):
                         content.append(pctxt.get_line())
                         pctxt.next()
                     pctxt.eat_empty_lines() # Skip empty remaining lines
@@ -68,6 +69,7 @@ class Parser(parser.Parser):
 
             template = pctxt.templates.get_template("parser/example.tpl")
             return template.render(
+                pctxt=pctxt,
                 label=label,
                 desc=desc,
                 content=content

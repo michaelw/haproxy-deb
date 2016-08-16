@@ -15,4 +15,4 @@ Index: haproxy/contrib/systemd/haproxy.service.in
 +Wants=syslog.service
  
  [Service]
- ExecStartPre=@SBINDIR@/haproxy -f /etc/haproxy/haproxy.cfg -c -q
+ Environment="CONFIG=/etc/haproxy/haproxy.cfg" "PIDFILE=/run/haproxy.pid"

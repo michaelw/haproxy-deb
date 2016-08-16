@@ -23,8 +23,9 @@
 #define _PROTO_PROTO_HTTP_H
 
 #include <common/config.h>
+#include <types/action.h>
 #include <types/proto_http.h>
-#include <types/session.h>
+#include <types/stream.h>
 #include <types/task.h>
 
 /*
@@ -63,30 +64,31 @@ extern char *get_http_auth_buff;
 #define HTTP_IS_TOKEN(x) (http_is_token[(unsigned char)(x)])
 #define HTTP_IS_VER_TOKEN(x) (http_is_ver_token[(unsigned char)(x)])
 
-int process_cli(struct session *s);
-int process_srv_data(struct session *s);
-int process_srv_conn(struct session *s);
-int http_wait_for_request(struct session *s, struct channel *req, int an_bit);
-int http_process_req_common(struct session *s, struct channel *req, int an_bit, struct proxy *px);
-int http_process_request(struct session *s, struct channel *req, int an_bit);
-int http_process_tarpit(struct session *s, struct channel *req, int an_bit);
-int http_wait_for_request_body(struct session *s, struct channel *req, int an_bit);
+int process_cli(struct stream *s);
+int process_srv_data(struct stream *s);
+int process_srv_conn(struct stream *s);
+int http_wait_for_request(struct stream *s, struct channel *req, int an_bit);
+int http_process_req_common(struct stream *s, struct channel *req, int an_bit, struct proxy *px);
+int http_process_request(struct stream *s, struct channel *req, int an_bit);
+int http_process_tarpit(struct stream *s, struct channel *req, int an_bit);
+int http_wait_for_request_body(struct stream *s, struct channel *req, int an_bit);
 int http_send_name_header(struct http_txn *txn, struct proxy* be, const char* svr_name);
-int http_wait_for_response(struct session *s, struct channel *rep, int an_bit);
-int http_process_res_common(struct session *s, struct channel *rep, int an_bit, struct proxy *px);
-int http_request_forward_body(struct session *s, struct channel *req, int an_bit);
-int http_response_forward_body(struct session *s, struct channel *res, int an_bit);
+int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit);
+int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, struct proxy *px);
+int http_request_forward_body(struct stream *s, struct channel *req, int an_bit);
+int http_response_forward_body(struct stream *s, struct channel *res, int an_bit);
+void http_msg_analyzer(struct http_msg *msg, struct hdr_idx *idx);
+void http_txn_reset_req(struct http_txn *txn);
+void http_txn_reset_res(struct http_txn *txn);
 
-void debug_hdr(const char *dir, struct session *s, const char *start, const char *end);
-void get_srv_from_appsession(struct session *s, const char *begin, int len);
-int apply_filter_to_req_headers(struct session *s, struct channel *req, struct hdr_exp *exp);
-int apply_filter_to_req_line(struct session *s, struct channel *req, struct hdr_exp *exp);
-int apply_filters_to_request(struct session *s, struct channel *req, struct proxy *px);
-int apply_filters_to_response(struct session *s, struct channel *rtr, struct proxy *px);
-void manage_client_side_appsession(struct session *s, const char *buf, int len);
-void manage_client_side_cookies(struct session *s, struct channel *req);
-void manage_server_side_cookies(struct session *s, struct channel *rtr);
-void check_response_for_cacheability(struct session *s, struct channel *rtr);
+void debug_hdr(const char *dir, struct stream *s, const char *start, const char *end);
+int apply_filter_to_req_headers(struct stream *s, struct channel *req, struct hdr_exp *exp);
+int apply_filter_to_req_line(struct stream *s, struct channel *req, struct hdr_exp *exp);
+int apply_filters_to_request(struct stream *s, struct channel *req, struct proxy *px);
+int apply_filters_to_response(struct stream *s, struct channel *rtr, struct proxy *px);
+void manage_client_side_cookies(struct stream *s, struct channel *req);
+void manage_server_side_cookies(struct stream *s, struct channel *rtr);
+void check_response_for_cacheability(struct stream *s, struct channel *rtr);
 int stats_check_uri(struct stream_interface *si, struct http_txn *txn, struct proxy *backend);
 void init_proto_http();
 int http_find_full_header2(const char *name, int len,
@@ -95,46 +97,76 @@ int http_find_full_header2(const char *name, int len,
 int http_find_header2(const char *name, int len,
 		      char *sol, struct hdr_idx *idx,
 		      struct hdr_ctx *ctx);
+int http_find_next_header(char *sol, struct hdr_idx *idx,
+                          struct hdr_ctx *ctx);
 char *find_hdr_value_end(char *s, const char *e);
+char *extract_cookie_value(char *hdr, const char *hdr_end, char *cookie_name,
+                           size_t cookie_name_l, int list, char **value, int *value_l);
 int http_header_match2(const char *hdr, const char *end, const char *name, int len);
 int http_remove_header2(struct http_msg *msg, struct hdr_idx *idx, struct hdr_ctx *ctx);
 int http_header_add_tail2(struct http_msg *msg, struct hdr_idx *hdr_idx, const char *text, int len);
-void http_sess_log(struct session *s);
-void http_perform_server_redirect(struct session *s, struct stream_interface *si);
-void http_return_srv_error(struct session *s, struct stream_interface *si);
-void http_capture_bad_message(struct error_snapshot *es, struct session *s,
+int http_replace_req_line(int action, const char *replace, int len, struct proxy *px, struct stream *s);
+void http_set_status(unsigned int status, struct stream *s);
+int http_transform_header_str(struct stream* s, struct http_msg *msg, const char* name,
+                              unsigned int name_len, const char *str, struct my_regex *re,
+                              int action);
+void inet_set_tos(int fd, const struct sockaddr_storage *from, int tos);
+void http_perform_server_redirect(struct stream *s, struct stream_interface *si);
+void http_return_srv_error(struct stream *s, struct stream_interface *si);
+void http_capture_bad_message(struct error_snapshot *es, struct stream *s,
                               struct http_msg *msg,
 			      enum ht_state state, struct proxy *other_end);
 unsigned int http_get_hdr(const struct http_msg *msg, const char *hname, int hlen,
 			  struct hdr_idx *idx, int occ,
 			  struct hdr_ctx *ctx, char **vptr, int *vlen);
+char *http_get_path(struct http_txn *txn);
+const char *get_reason(unsigned int status);
 
-void http_init_txn(struct session *s);
-void http_end_txn(struct session *s);
-void http_reset_txn(struct session *s);
-void http_adjust_conn_mode(struct session *s, struct http_txn *txn, struct http_msg *msg);
+struct http_txn *http_alloc_txn(struct stream *s);
+void http_init_txn(struct stream *s);
+void http_end_txn(struct stream *s);
+void http_reset_txn(struct stream *s);
+void http_adjust_conn_mode(struct stream *s, struct http_txn *txn, struct http_msg *msg);
 
-struct http_req_rule *parse_http_req_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
-struct http_res_rule *parse_http_res_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
+struct act_rule *parse_http_req_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
+struct act_rule *parse_http_res_cond(const char **args, const char *file, int linenum, struct proxy *proxy);
 void free_http_req_rules(struct list *r);
 void free_http_res_rules(struct list *r);
-struct chunk *http_error_message(struct session *s, int msgnum);
+struct chunk *http_error_message(struct stream *s, int msgnum);
 struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, struct proxy *curproxy,
-                                               const char **args, char **errmsg, int use_fmt);
-int smp_fetch_cookie(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                 const struct arg *args, struct sample *smp, const char *kw);
+                                               const char **args, char **errmsg, int use_fmt, int dir);
+int smp_fetch_cookie(const struct arg *args, struct sample *smp, const char *kw, void *private);
+int smp_fetch_base32(const struct arg *args, struct sample *smp, const char *kw, void *private);
 
 enum http_meth_t find_http_meth(const char *str, const int len);
 
-struct http_req_action_kw *action_http_req_custom(const char *kw);
-struct http_res_action_kw *action_http_res_custom(const char *kw);
+struct action_kw *action_http_req_custom(const char *kw);
+struct action_kw *action_http_res_custom(const char *kw);
+int val_hdr(struct arg *arg, char **err_msg);
 
-static inline void http_req_keywords_register(struct http_req_action_kw_list *kw_list)
+int smp_prefetch_http(struct proxy *px, struct stream *s, unsigned int opt,
+                  const struct arg *args, struct sample *smp, int req_vol);
+
+enum act_return http_action_req_capture_by_id(struct act_rule *rule, struct proxy *px,
+                                              struct session *sess, struct stream *s, int flags);
+enum act_return http_action_res_capture_by_id(struct act_rule *rule, struct proxy *px,
+                                              struct session *sess, struct stream *s, int flags);
+
+/* Note: these functions *do* modify the sample. Even in case of success, at
+ * least the type and uint value are modified.
+ */
+#define CHECK_HTTP_MESSAGE_FIRST() \
+	do { int r = smp_prefetch_http(smp->px, smp->strm, smp->opt, args, smp, 1); if (r <= 0) return r; } while (0)
+
+#define CHECK_HTTP_MESSAGE_FIRST_PERM() \
+	do { int r = smp_prefetch_http(smp->px, smp->strm, smp->opt, args, smp, 0); if (r <= 0) return r; } while (0)
+
+static inline void http_req_keywords_register(struct action_kw_list *kw_list)
 {
 	LIST_ADDQ(&http_req_keywords.list, &kw_list->list);
 }
 
-static inline void http_res_keywords_register(struct http_res_action_kw_list *kw_list)
+static inline void http_res_keywords_register(struct action_kw_list *kw_list)
 {
 	LIST_ADDQ(&http_res_keywords.list, &kw_list->list);
 }
@@ -204,6 +236,14 @@ static inline int http_body_bytes(const struct http_msg *msg)
 	if (len > msg->body_len)
 		len = msg->body_len;
 	return len;
+}
+
+/* for an http-request action ACT_HTTP_REQ_TRK_*, return a tracking index
+ * starting at zero for SC0. Unknown actions also return zero.
+ */
+static inline int http_req_trk_idx(int trk_action)
+{
+	return trk_action - ACT_ACTION_TRK_SC0;
 }
 
 /* for debugging, reports the HTTP message state name */

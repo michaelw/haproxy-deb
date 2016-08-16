@@ -20,11 +20,13 @@
 #include <proto/log.h>
 
 static struct list pools = LIST_HEAD_INIT(pools);
-char mem_poison_byte = 0;
+int mem_poison_byte = -1;
 
 /* Try to find an existing shared pool with the same characteristics and
  * returns it, otherwise creates this one. NULL is returned if no memory
- * is available for a new creation.
+ * is available for a new creation. Two flags are supported :
+ *   - MEM_F_SHARED to indicate that the pool may be shared with other users
+ *   - MEM_F_EXACT to indicate that the size must not be rounded up
  */
 struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 {
@@ -39,8 +41,10 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 	 * ease merging of entries. Note that the rounding is a power of two.
 	 */
 
-	align = 16;
-	size  = (size + align - 1) & -align;
+	if (!(flags & MEM_F_EXACT)) {
+		align = 16;
+		size  = (size + align - 1) & -align;
+	}
 
 	start = &pools;
 	pool = NULL;
@@ -79,28 +83,42 @@ struct pool_head *create_pool(char *name, unsigned int size, unsigned int flags)
 	return pool;
 }
 
-/* Allocate a new entry for pool <pool>, and return it for immediate use.
- * NULL is returned if no memory is available for a new creation. A call
- * to the garbage collector is performed before returning NULL.
+/* Allocates new entries for pool <pool> until there are at least <avail> + 1
+ * available, then returns the last one for immediate use, so that at least
+ * <avail> are left available in the pool upon return. NULL is returned if the
+ * last entry could not be allocated. It's important to note that at least one
+ * allocation is always performed even if there are enough entries in the pool.
+ * A call to the garbage collector is performed at most once in case malloc()
+ * returns an error, before returning NULL.
  */
-void *pool_refill_alloc(struct pool_head *pool)
+void *pool_refill_alloc(struct pool_head *pool, unsigned int avail)
 {
-	void *ret;
+	void *ptr = NULL;
+	int failed = 0;
 
-	if (pool->limit && (pool->allocated >= pool->limit))
-		return NULL;
-	ret = CALLOC(1, pool->size);
-	if (!ret) {
-		pool_gc2();
-		ret = CALLOC(1, pool->size);
-		if (!ret)
+	/* stop point */
+	avail += pool->used;
+
+	while (1) {
+		if (pool->limit && pool->allocated >= pool->limit)
 			return NULL;
+
+		ptr = MALLOC(pool->size);
+		if (!ptr) {
+			if (failed)
+				return NULL;
+			failed++;
+			pool_gc2();
+			continue;
+		}
+		if (++pool->allocated > avail)
+			break;
+
+		*(void **)ptr = (void *)pool->free_list;
+		pool->free_list = ptr;
 	}
-	if (mem_poison_byte)
-		memset(ret, mem_poison_byte, pool->size);
-	pool->allocated++;
 	pool->used++;
-	return ret;
+	return ptr;
 }
 
 /*

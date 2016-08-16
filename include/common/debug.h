@@ -23,6 +23,7 @@
 #define _COMMON_DEBUG_H
 
 #include <common/config.h>
+#include <common/memory.h>
 
 #ifdef DEBUG_FULL
 #define DPRINTF(x...) fprintf(x)
@@ -42,17 +43,28 @@
 #define ABORT_NOW() (*(int*)0=0)
 
 /* this one is provided for easy code tracing.
- * Usage: TRACE(sess||0, fmt, args...);
- *        TRACE(sess, "");
+ * Usage: TRACE(strm||0, fmt, args...);
+ *        TRACE(strm, "");
  */
-#define TRACE(sess, fmt, args...) do {                            \
+#define TRACE(strm, fmt, args...) do {                            \
 	fprintf(stderr,                                           \
-		"%d.%06d [%s:%d %s] [sess %p(%x)] " fmt "\n",      \
+		"%d.%06d [%s:%d %s] [strm %p(%x)] " fmt "\n",      \
 		(int)now.tv_sec, (int)now.tv_usec,                \
 		__FILE__, __LINE__, __FUNCTION__,                 \
-		sess, sess?((struct session *)sess)->uniq_id:~0U, \
+		strm, strm?((struct stream *)strm)->uniq_id:~0U, \
 		##args);                                           \
         } while (0)
 
+/* This one is useful to automatically apply poisonning on an area returned
+ * by malloc(). Only "p_" is required to make it work, and to define a poison
+ * byte using -dM.
+ */
+static inline void *p_malloc(size_t size)
+{
+	void *ret = malloc(size);
+	if (mem_poison_byte >= 0 && ret)
+		memset(ret, mem_poison_byte, size);
+	return ret;
+}
 
 #endif /* _COMMON_DEBUG_H */

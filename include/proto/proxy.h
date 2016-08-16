@@ -43,13 +43,14 @@ int resume_proxy(struct proxy *p);
 void stop_proxy(struct proxy *p);
 void pause_proxies(void);
 void resume_proxies(void);
-int  session_set_backend(struct session *s, struct proxy *be);
+int  stream_set_backend(struct stream *s, struct proxy *be);
 
 const char *proxy_cap_str(int cap);
 const char *proxy_mode_str(int mode);
 void proxy_store_name(struct proxy *px);
-struct proxy *findproxy_mode(const char *name, int mode, int cap);
-struct proxy *findproxy(const char *name, int cap);
+struct proxy *proxy_find_by_id(int id, int cap, int table);
+struct proxy *proxy_find_by_name(const char *name, int cap, int table);
+struct proxy *proxy_find_best_match(int cap, const char *name, int id, int *diff);
 struct server *findserver(const struct proxy *px, const char *name);
 int proxy_cfg_ensure_no_http(struct proxy *curproxy);
 void init_new_proxy(struct proxy *p);
@@ -65,6 +66,30 @@ static inline const char *proxy_type_str(struct proxy *proxy)
 	return proxy_cap_str(proxy->cap);
 }
 
+/* Find the frontend having name <name>. The name may also start with a '#' to
+ * reference a numeric id. NULL is returned if not found.
+ */
+static inline struct proxy *proxy_fe_by_name(const char *name)
+{
+	return proxy_find_by_name(name, PR_CAP_FE, 0);
+}
+
+/* Find the backend having name <name>. The name may also start with a '#' to
+ * reference a numeric id. NULL is returned if not found.
+ */
+static inline struct proxy *proxy_be_by_name(const char *name)
+{
+	return proxy_find_by_name(name, PR_CAP_BE, 0);
+}
+
+/* Find the table having name <name>. The name may also start with a '#' to
+ * reference a numeric id. NULL is returned if not found.
+ */
+static inline struct proxy *proxy_tbl_by_name(const char *name)
+{
+	return proxy_find_by_name(name, 0, 1);
+}
+
 /* this function initializes all timeouts for proxy p */
 static inline void proxy_reset_timeouts(struct proxy *proxy)
 {
@@ -73,7 +98,6 @@ static inline void proxy_reset_timeouts(struct proxy *proxy)
 	proxy->timeout.queue = TICK_ETERNITY;
 	proxy->timeout.connect = TICK_ETERNITY;
 	proxy->timeout.server = TICK_ETERNITY;
-	proxy->timeout.appsession = TICK_ETERNITY;
 	proxy->timeout.httpreq = TICK_ETERNITY;
 	proxy->timeout.check = TICK_ETERNITY;
 	proxy->timeout.tunnel = TICK_ETERNITY;

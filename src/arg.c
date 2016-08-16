@@ -17,10 +17,9 @@
 #include <common/standard.h>
 #include <proto/arg.h>
 
-static const char *arg_type_names[ARGT_NBTYPES] = {
+const char *arg_type_names[ARGT_NBTYPES] = {
 	[ARGT_STOP] = "end of arguments",
-	[ARGT_UINT] = "unsigned integer",
-	[ARGT_SINT] = "signed integer",
+	[ARGT_SINT] = "integer",
 	[ARGT_STR]  = "string",
 	[ARGT_IPV4] = "IPv4 address",
 	[ARGT_MSK4] = "IPv4 mask",
@@ -34,13 +33,15 @@ static const char *arg_type_names[ARGT_NBTYPES] = {
 	[ARGT_SRV]  = "server",
 	[ARGT_USR]  = "user list",
 	[ARGT_MAP]  = "map",
+	[ARGT_REG]  = "regex",
+	[ARGT_VAR]  = "variable",
 	/* Unassigned types must never happen. Better crash during parsing if they do. */
 };
 
 /* This dummy arg list may be used by default when no arg is found, it helps
  * parsers by removing pointer checks.
  */
-struct arg empty_arg_list[8] = { };
+struct arg empty_arg_list[ARGM_NBARGS] = { };
 
 /* This function clones a struct arg_list template into a new one which is
  * returned.
@@ -86,9 +87,9 @@ struct arg_list *arg_list_add(struct arg_list *orig, struct arg *arg, int pos)
  * type ARGT_STOP (0), unless the mask indicates that no argument is supported.
  * Unresolved arguments are appended to arg list <al>, which also serves as a
  * template to create new entries. The mask is composed of a number of
- * mandatory arguments in its lower 4 bits, and a concatenation of each
- * argument type in each subsequent 4-bit block. If <err_msg> is not NULL, it
- * must point to a freeable or NULL pointer.
+ * mandatory arguments in its lower ARGM_BITS bits, and a concatenation of each
+ * argument type in each subsequent ARGT_BITS-bit sblock. If <err_msg> is not
+ * NULL, it must point to a freeable or NULL pointer.
  */
 int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
                   char **err_msg, const char **err_ptr, int *err_arg,
@@ -104,12 +105,12 @@ int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
 
 	*argp = NULL;
 
-	min_arg = mask & 15;
-	mask >>= 4;
+	min_arg = mask & ARGM_MASK;
+	mask >>= ARGM_BITS;
 
 	pos = 0;
-	/* find between 0 and 8 the max number of args supported by the mask */
-	for (nbarg = 0; nbarg < 8 && ((mask >> (nbarg * 4)) & 0xF); nbarg++);
+	/* find between 0 and NBARGS the max number of args supported by the mask */
+	for (nbarg = 0; nbarg < ARGM_NBARGS && ((mask >> (nbarg * ARGT_BITS)) & ARGT_MASK); nbarg++);
 
 	if (!nbarg)
 		goto end_parse;
@@ -124,6 +125,8 @@ int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
 
 	/* Note: empty arguments after a comma always exist. */
 	while (pos < nbarg) {
+		unsigned int uint;
+
 		beg = in;
 		while (len && *in != ',') {
 			in++;
@@ -138,34 +141,16 @@ int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
 		free(word);
 		word = my_strndup(beg, in - beg);
 
-		arg->type = (mask >> (pos * 4)) & 15;
+		arg->type = (mask >> (pos * ARGT_BITS)) & ARGT_MASK;
 
 		switch (arg->type) {
 		case ARGT_SINT:
 			if (in == beg)	  // empty number
 				goto empty_err;
-			else if (*beg < '0' || *beg > '9') {
-				beg++;
-				arg->data.sint = read_uint(&beg, in);
-				if (beg < in)
-					goto parse_err;
-				if (*word == '-')
-					arg->data.sint = -arg->data.sint;
-				else if (*word != '+')    // invalid first character
-					goto parse_err;
-				break;
-			}
-
-			arg->type = ARGT_UINT;
-			/* fall through ARGT_UINT if no sign is present */
-
-		case ARGT_UINT:
-			if (in == beg)    // empty number
-				goto empty_err;
-
-			arg->data.uint = read_uint(&beg, in);
+			arg->data.sint = read_int64(&beg, in);
 			if (beg < in)
 				goto parse_err;
+			arg->type = ARGT_SINT;
 			break;
 
 		case ARGT_FE:
@@ -173,6 +158,7 @@ int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
 		case ARGT_TAB:
 		case ARGT_SRV:
 		case ARGT_USR:
+		case ARGT_REG:
 			/* These argument types need to be stored as strings during
 			 * parsing then resolved later.
 			 */
@@ -224,22 +210,23 @@ int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
 			if (in == beg)    // empty time
 				goto empty_err;
 
-			ptr_err = parse_time_err(word, &arg->data.uint, TIME_UNIT_MS);
+			ptr_err = parse_time_err(word, &uint, TIME_UNIT_MS);
 			if (ptr_err)
 				goto parse_err;
-
-			arg->type = ARGT_UINT;
+			arg->data.sint = uint;
+			arg->type = ARGT_SINT;
 			break;
 
 		case ARGT_SIZE:
 			if (in == beg)    // empty size
 				goto empty_err;
 
-			ptr_err = parse_size_err(word, &arg->data.uint);
+			ptr_err = parse_size_err(word, &uint);
 			if (ptr_err)
 				goto parse_err;
 
-			arg->type = ARGT_UINT;
+			arg->data.sint = uint;
+			arg->type = ARGT_SINT;
 			break;
 
 			/* FIXME: other types need to be implemented here */
@@ -265,7 +252,7 @@ int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
 		/* not enough arguments */
 		memprintf(err_msg,
 		          "missing arguments (got %d/%d), type '%s' expected",
-		          pos, min_arg, arg_type_names[(mask >> (pos * 4)) & 15]);
+		          pos, min_arg, arg_type_names[(mask >> (pos * ARGT_BITS)) & ARGT_MASK]);
 		goto err;
 	}
 
@@ -303,16 +290,16 @@ int make_arg_list(const char *in, int len, unsigned int mask, struct arg **argp,
 
  empty_err:
 	memprintf(err_msg, "expected type '%s' at position %d, but got nothing",
-	          arg_type_names[(mask >> (pos * 4)) & 15], pos + 1);
+	          arg_type_names[(mask >> (pos * ARGT_BITS)) & ARGT_MASK], pos + 1);
 	goto err;
 
  parse_err:
 	memprintf(err_msg, "failed to parse '%s' as type '%s' at position %d",
-	          word, arg_type_names[(mask >> (pos * 4)) & 15], pos + 1);
+	          word, arg_type_names[(mask >> (pos * ARGT_BITS)) & ARGT_MASK], pos + 1);
 	goto err;
 
  not_impl:
 	memprintf(err_msg, "parsing for type '%s' was not implemented, please report this bug",
-	          arg_type_names[(mask >> (pos * 4)) & 15]);
+	          arg_type_names[(mask >> (pos * ARGT_BITS)) & ARGT_MASK]);
 	goto err;
 }

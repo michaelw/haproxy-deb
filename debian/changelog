@@ -1,16 +1,344 @@
-haproxy (1.5.14-1ubuntu0.15.10.1instart1) precise; urgency=low
+haproxy (1.6.8-1ppa1~precise) precise; urgency=medium
 
-  * removed systemd dependency from control and rules
+  * Backport for Precise (PPA).
 
- -- Michael Weber <mweber@instartlogic.com>  Wed, 20 Jul 2016 13:58:02 -0700
+ -- Vincent Bernat <bernat@debian.org>  Tue, 16 Aug 2016 14:46:18 +0200
 
-haproxy (1.5.14-1ubuntu0.15.10.1) wily; urgency=medium
+haproxy (1.6.8-1) unstable; urgency=medium
 
-  * Ensure that haproxy processes are terminated correctly when executing
-    stop/restart operations, easing backports to pre-systemd versions of
-    Ubuntu (LP: #1477198, #1481737).
+  * New upstream release (see CHANGELOG):
+    + BUG/MAJOR: compression: initialize avail_in/next_in even during
+      flush
+    + BUG/MAJOR: server: the "sni" directive could randomly cause trouble
+    + BUG/MAJOR: stick-counters: possible crash when using sc_trackers
+      with wrong table
 
- -- James Page <james.page@ubuntu.com>  Mon, 09 Nov 2015 16:51:46 +0000
+ -- Vincent Bernat <bernat@debian.org>  Sun, 14 Aug 2016 14:17:08 +0200
+
+haproxy (1.6.7-1ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Thu, 14 Jul 2016 08:37:35 +0200
+
+haproxy (1.6.7-1) unstable; urgency=medium
+
+  * New upstream release (see CHANGELOG):
+    + BUG/MAJOR: fix use-after-free crash on start
+    + BUG/MEDIUM: dns: fix alignment issues in the DNS response parser
+
+ -- Vincent Bernat <bernat@debian.org>  Thu, 14 Jul 2016 08:29:43 +0200
+
+haproxy (1.6.6-1ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Tue, 28 Jun 2016 10:37:53 +0200
+
+haproxy (1.6.6-1) unstable; urgency=medium
+
+  * New upstream release (see CHANGELOG):
+    + BUG/MAJOR: fix listening IP address storage for frontends
+    + BUG/MAJOR: http: fix breakage of "reqdeny" causing random crashes
+    + BUG/MEDIUM: stick-tables: fix breakage in table converters
+    + BUG/MEDIUM: dns: unbreak DNS resolver after header fix
+    + BUG/MEDIUM: stats: show servers state may show an servers from another
+      backend
+    + BUG/MEDIUM: fix risk of segfault with "show tls-keys"
+    + BUG/MEDIUM: sticktables: segfault in some configuration error cases
+    + BUG/MEDIUM: lua: converters doesn't work
+    + BUG/MEDIUM: http: add-header: buffer overwritten
+    + BUG/MEDIUM: external-checks: close all FDs right after the fork()
+    + BUG/MAJOR: external-checks: use asynchronous signal delivery
+  * Drop haproxy.service-check-config-before-reload.patch. Applied
+    upstream.
+
+ -- Vincent Bernat <bernat@debian.org>  Tue, 28 Jun 2016 10:13:33 +0200
+
+haproxy (1.6.5-2ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Sun, 12 Jun 2016 20:13:32 +0200
+
+haproxy (1.6.5-2) unstable; urgency=high
+
+  * Add a patch to fix CVE-2016-5360. Closes: #826869.
+    + BUG/MAJOR: http: fix breakage of "reqdeny" causing random crashes
+
+ -- Vincent Bernat <bernat@debian.org>  Sat, 11 Jun 2016 22:23:50 +0200
+
+haproxy (1.6.5-1ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Fri, 13 May 2016 08:33:58 +0200
+
+haproxy (1.6.5-1) unstable; urgency=medium
+
+  * New upstream release (see CHANGELOG):
+    + BUG/MAJOR: channel: fix miscalculation of available buffer space
+    + BUG/MAJOR: Fix crash in http_get_fhdr with exactly MAX_HDR_HISTORY
+      headers
+    + BUG/MEDIUM: channel: don't allow to overwrite the reserve until
+      connected
+    + BUG/MEDIUM: channel: fix inconsistent handling of 4GB-1 transfers
+    + BUG/MEDIUM: channel: incorrect polling condition may delay event
+      delivery
+    + BUG/MEDIUM: dns: fix alignment issue when building DNS queries
+    + BUG/MEDIUM: fix maxaccept computation on per-process listeners
+    + BUG/MEDIUM: Fix RFC5077 resumption when more than TLS_TICKETS_NO are
+      present
+    + BUG/MEDIUM: http: fix risk of CPU spikes with pipelined requests from
+      dead client
+    + BUG/MEDIUM: log: fix risk of segfault when logging HTTP fields in TCP
+      mode
+    + BUG/MEDIUM: lua: protects the upper boundary of the argument list for
+      converters/fetches.
+    + BUG/MEDIUM: peers: fix incorrect age in frequency counters
+    + BUG/MEDIUM: sample: initialize the pointer before parse_binary call.
+    + BUG/MEDIUM: stats: show backend may show an empty or incomplete result
+    + BUG/MEDIUM: stats: show servers state may show an empty or incomplete
+      result
+    + BUG/MEDIUM: stick-tables: some sample-fetch doesn't work in the
+      connection state.
+    + BUG/MEDIUM: stream: ensure the SI_FL_DONT_WAKE flag is properly cleared
+    + BUG/MEDIUM: trace.c: rdtsc() is defined in two files
+    + MEDIUM: unblock signals on startup.
+  * Bump standards to 3.9.8; no changes needed.
+
+ -- Apollon Oikonomopoulos <apoikos@debian.org>  Wed, 11 May 2016 11:07:24 +0300
+
+haproxy (1.6.4-3ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Thu, 24 Mar 2016 20:43:01 +0100
+
+haproxy (1.6.4-3) unstable; urgency=medium
+
+  * d/init: remove support for dynamic script name. This enable haproxy to
+    be started on boot.
+
+ -- Vincent Bernat <bernat@debian.org>  Thu, 24 Mar 2016 20:36:08 +0100
+
+haproxy (1.6.4-2ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Sat, 19 Mar 2016 21:32:23 +0100
+
+haproxy (1.6.4-2) unstable; urgency=medium
+
+  * d/init: fix SysV init script w/ respect to handling EXTRAOPTS on check.
+  * d/control: add Pre-Depends for dpkg-maintscript-helper support of
+    dir_to_symlink.
+
+ -- Vincent Bernat <bernat@debian.org>  Sat, 19 Mar 2016 16:35:20 +0100
+
+haproxy (1.6.4-1ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+    + Restore haproxy-dbg package.
+
+ -- Vincent Bernat <bernat@debian.org>  Sat, 19 Mar 2016 16:27:23 +0100
+
+haproxy (1.6.4-1) unstable; urgency=medium
+
+  * New upstream release (see CHANGELOG):
+    + BUG/MAJOR: http-reuse: fix risk of orphaned connections.
+    + BUG/MAJOR: lua: applets can't sleep.
+    + BUG/MAJOR: samples: check smp->strm before using it. 
+    + BUG/MAJOR: servers state: server port is erased when dns resolution is
+      enabled on a server.
+    + BUG/MAJOR: vars: always retrieve the stream and session from the sample
+    + BUG/MEDIUM: buffers: do not round up buffer size during allocation
+    + BUG/MEDIUM: dns: no DNS resolution happens if no ports provided to the
+      nameserver
+    + BUG/MEDIUM: servers state: server port is used uninitialized
+    + BUG/MEDIUM: config: Adding validation to stick-table expire value.
+    + BUG/MEDIUM: sample: http_date() doesn't provide the right day of the
+      week
+    + BUG/MEDIUM: channel: fix miscalculation of available buffer space.
+    + BUG/MEDIUM: http-reuse: do not share private connections across backends
+    + BUG/MEDIUM: ssl: fix off-by-one in ALPN list allocation
+    + BUG/MEDIUM: ssl: fix off-by-one in NPN list allocation
+    + BUG/MEDIUM: stats: stats bind-process doesn't propagate the process mask
+      correctly
+    + BUG/MEDIUM: chunks: always reject negative-length chunks
+    + BUG/MEDIUM: cfgparse: wrong argument offset after parsing server "sni"
+      keyword
+
+  [ Vincent Bernat ]
+  * haproxy.init: append ${EXTRAOPTS} when verifying configuration file.
+  * haproxy.init: move EXTRAOPTS after all other parameters.
+  * haproxy.init: management of multiple HAProxy instances with SysV
+    init.d script, courtesy of Ivan Savcic.
+
+  [ Apollon Oikonomopoulos ]
+  * Bump standards to 3.9.7:
+    + haproxy-doc: move the additional documentation from
+      /usr/share/doc/haproxy-doc to /usr/share/doc/haproxy, as per the
+      recommendation in Policy §12.3.
+    + Add compatibility symlinks from /usr/share/doc/haproxy-doc to
+      /usr/share/doc/haproxy.
+  * Enable all hardening flags.
+  * d/control: use HTTPS for Vcs-*
+  * Use www.haproxy.org as the project's homepage in d/control and
+    d/copyright.
+  * d/copyright: adjust debian/* years.
+  * Add basic DEP-8 tests.
+  * Drop the haproxy-dbg binary package in favor of ddebs.
+  * haproxy-doc:
+    + Use dpkg-maintscript-helper dir_to_symlink for the compatibility
+      symlinks.
+    + Add Lua documentation doc-base entry.
+
+ -- Apollon Oikonomopoulos <apoikos@debian.org>  Tue, 15 Mar 2016 21:04:11 +0200
+
+haproxy (1.6.3-1ppa1~trusty) trusty; urgency=medium
+
+  * Backport for Trusty (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Fri, 01 Jan 2016 12:37:57 +0100
+
+haproxy (1.6.3-1ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Fri, 01 Jan 2016 12:39:48 +0100
+
+haproxy (1.6.3-1) unstable; urgency=medium
+
+  [ Apollon Oikonomopoulos ]
+  * haproxy.init: use s-s-d's --pidfile option.
+    Thanks to Louis Bouchard (Closes: 804530)
+
+  [ Vincent Bernat ]
+  * watch: fix d/watch to look for 1.6 version
+  * Imported Upstream version 1.6.3
+
+ -- Vincent Bernat <bernat@debian.org>  Thu, 31 Dec 2015 08:10:10 +0100
+
+haproxy (1.6.2-2ppa2~trusty) trusty; urgency=medium
+
+  * Fix stop action in init.d script to not use start-stop-daemon whose
+    --pid option does not exist yet. This patch was present in 1.5 and was
+    mistakenly removed from 1.6.
+
+ -- Vincent Bernat <bernat@debian.org>  Mon, 09 Nov 2015 11:41:20 +0100
+
+haproxy (1.6.2-2ppa1~trusty) trusty; urgency=medium
+
+  * Backport for Trusty (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Tue, 03 Nov 2015 21:41:51 +0100
+
+haproxy (1.6.2-2ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Tue, 03 Nov 2015 21:43:31 +0100
+
+haproxy (1.6.2-2) unstable; urgency=medium
+
+  * Enable USE_REGPARM on amd64 as well.
+
+ -- Vincent Bernat <bernat@debian.org>  Tue, 03 Nov 2015 21:21:30 +0100
+
+haproxy (1.6.2-1) unstable; urgency=medium
+
+  * New upstream release.
+    - BUG/MAJOR: dns: first DNS response packet not matching queried
+                      hostname may lead to a loop
+    - BUG/MAJOR: http: don't requeue an idle connection that is already
+                       queued
+  * Upload to unstable.
+
+ -- Vincent Bernat <bernat@debian.org>  Tue, 03 Nov 2015 13:36:22 +0100
+
+haproxy (1.6.1-2) experimental; urgency=medium
+
+  * Build the Lua manpage in -arch, fixes FTBFS in binary-only builds.
+
+ -- Apollon Oikonomopoulos <apoikos@debian.org>  Thu, 22 Oct 2015 12:19:41 +0300
+
+haproxy (1.6.1-1ppa1~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+    + Documentation package still removed. Don't ship Lua documentation
+      either.
+
+ -- Vincent Bernat <bernat@debian.org>  Thu, 22 Oct 2015 11:11:52 +0200
+
+haproxy (1.6.1-1) experimental; urgency=medium
+
+  [ Vincent Bernat ]
+  * New upstream release.
+    - BUG/MAJOR: ssl: free the generated SSL_CTX if the LRU cache is
+                      disabled
+  * Drop 0001-BUILD-install-only-relevant-and-existing-documentati.patch.
+
+  [ Apollon Oikonomopoulos ]
+  * Ship and generate Lua API documentation.
+
+ -- Vincent Bernat <bernat@debian.org>  Thu, 22 Oct 2015 10:45:55 +0200
+
+haproxy (1.6.0+ds1-1ppa2~precise) precise; urgency=medium
+
+  * Backport for Precise (PPA).
+    + Remove documentation package.
+    + Don't ship systemd unit.
+
+ -- Vincent Bernat <bernat@debian.org>  Wed, 14 Oct 2015 17:39:00 +0200
+
+haproxy (1.6.0+ds1-1) experimental; urgency=medium
+
+  * New upstream release!
+  * Add a patch to fix documentation installation:
+    + 0001-BUILD-install-only-relevant-and-existing-documentati.patch
+  * Update HAProxy documentation converter to a more recent version.
+
+ -- Vincent Bernat <bernat@debian.org>  Wed, 14 Oct 2015 17:29:19 +0200
+
+haproxy (1.6~dev7-1) experimental; urgency=medium
+
+  * New upstream release.
+
+ -- Vincent Bernat <bernat@debian.org>  Tue, 06 Oct 2015 16:01:26 +0200
+
+haproxy (1.6~dev5-1) experimental; urgency=medium
+
+  * New upstream release.
+
+ -- Vincent Bernat <bernat@debian.org>  Mon, 14 Sep 2015 15:50:28 +0200
+
+haproxy (1.6~dev4-1) experimental; urgency=medium
+
+  * New upstream release.
+  * Refresh debian/copyright.
+
+ -- Vincent Bernat <bernat@debian.org>  Sun, 30 Aug 2015 23:54:10 +0200
+
+haproxy (1.6~dev3-1) experimental; urgency=medium
+
+  * New upstream release.
+  * Enable Lua support.
+
+ -- Vincent Bernat <bernat@debian.org>  Sat, 15 Aug 2015 17:51:29 +0200
+
+haproxy (1.5.15-1) unstable; urgency=medium
+
+  * New upstream stable release including the following fix:
+    - BUG/MAJOR: http: don't call http_send_name_header() after an error
+
+ -- Vincent Bernat <bernat@debian.org>  Mon, 02 Nov 2015 07:34:19 +0100
+
+haproxy (1.5.14-1ppa1~vivid) vivid; urgency=medium
+
+  * Backport for Vivid (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Sat, 04 Jul 2015 07:42:29 +0200
 
 haproxy (1.5.14-1) unstable; urgency=high
 
@@ -20,6 +348,12 @@ haproxy (1.5.14-1) unstable; urgency=high
   * Add $named as a dependency for init script. Closes: #790638.
 
  -- Vincent Bernat <bernat@debian.org>  Fri, 03 Jul 2015 19:49:02 +0200
+
+haproxy (1.5.13-1ppa1~vivid) vivid; urgency=medium
+
+  * Backport for Vivid (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Sat, 27 Jun 2015 21:00:57 +0200
 
 haproxy (1.5.13-1) unstable; urgency=medium
 
@@ -39,6 +373,12 @@ haproxy (1.5.13-1) unstable; urgency=medium
                   for a proxy
 
  -- Vincent Bernat <bernat@debian.org>  Sat, 27 Jun 2015 20:52:07 +0200
+
+haproxy (1.5.12-1ppa1~vivid) vivid; urgency=medium
+
+  * Backport for Vivid (PPA).
+
+ -- Vincent Bernat <bernat@debian.org>  Tue, 26 May 2015 09:04:42 +0200
 
 haproxy (1.5.12-1) unstable; urgency=medium
 

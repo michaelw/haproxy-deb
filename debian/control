@@ -1,22 +1,24 @@
 Source: haproxy
 Section: net
 Priority: optional
-Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
-XSBC-Original-Maintainer: Debian HAProxy Maintainers <pkg-haproxy-maintainers@lists.alioth.debian.org>
+Maintainer: Debian HAProxy Maintainers <pkg-haproxy-maintainers@lists.alioth.debian.org>
 Uploaders: Apollon Oikonomopoulos <apoikos@debian.org>,
-           Prach Pongpanich <prachpub@gmail.com>,
+           Prach Pongpanich <prach@debian.org>,
            Vincent Bernat <bernat@debian.org>
-Standards-Version: 3.9.6
-Build-Depends: debhelper (>= 9), libpcre3-dev, libssl-dev
+Standards-Version: 3.9.8
+Build-Depends: debhelper (>= 9),
+               libpcre3-dev,
+               libssl-dev,
+               liblua5.3-dev
 Build-Depends-Indep: python, python-mako
-Homepage: http://haproxy.1wt.eu/
-Vcs-Git: git://anonscm.debian.org/pkg-haproxy/haproxy.git
-Vcs-Browser: http://anonscm.debian.org/gitweb/?p=pkg-haproxy/haproxy.git
+Homepage: http://www.haproxy.org/
+Vcs-Git: https://anonscm.debian.org/git/pkg-haproxy/haproxy.git
+Vcs-Browser: https://anonscm.debian.org/gitweb/?p=pkg-haproxy/haproxy.git
 
 Package: haproxy
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
-Suggests: vim-haproxy, haproxy-doc
+Suggests: vim-haproxy
 Description: fast and reliable load balancing reverse proxy
  HAProxy is a TCP/HTTP reverse proxy which is particularly suited for high
  availability environments. It features connection persistence through HTTP
@@ -37,20 +39,6 @@ Description: fast and reliable load balancing reverse proxy (debug symbols)
  status.
  .
  This package contains the debugging symbols for haproxy.
-
-Package: haproxy-doc
-Section: doc
-Priority: extra
-Architecture: all
-Depends: ${misc:Depends}, libjs-twitter-bootstrap (<< 3), libjs-jquery
-Description: fast and reliable load balancing reverse proxy (HTML documentation)
- HAProxy is a TCP/HTTP reverse proxy which is particularly suited for high
- availability environments. It features connection persistence through HTTP
- cookies, load balancing, header addition, modification, deletion both ways. It
- has request blocking capabilities and provides interface to display server
- status.
- .
- This package contains the HTML documentation for haproxy.
 
 Package: vim-haproxy
 Architecture: all

@@ -32,7 +32,9 @@
 #include <proto/fd.h>
 #include <proto/freq_ctr.h>
 #include <proto/log.h>
+#include <proto/listener.h>
 #include <proto/sample.h>
+#include <proto/stream.h>
 #include <proto/task.h>
 
 /* List head of all known bind keywords */
@@ -55,8 +57,7 @@ void enable_listener(struct listener *listener)
 			/* we don't want to enable this listener and don't
 			 * want any fd event to reach it.
 			 */
-			fd_stop_recv(listener->fd);
-			listener->state = LI_PAUSED;
+			unbind_listener(listener);
 		}
 		else if (listener->nbconn < listener->maxconn) {
 			fd_want_recv(listener->fd);
@@ -170,7 +171,7 @@ int resume_listener(struct listener *l)
 	return 1;
 }
 
-/* Marks a ready listener as full so that the session code tries to re-enable
+/* Marks a ready listener as full so that the stream code tries to re-enable
  * it upon next close() using resume_listener().
  */
 void listener_full(struct listener *l)
@@ -467,7 +468,7 @@ void listener_accept(int fd)
 
 		ret = l->accept(l, cfd, &addr);
 		if (unlikely(ret <= 0)) {
-			/* The connection was closed by session_accept(). Either
+			/* The connection was closed by stream_accept(). Either
 			 * we just have to ignore it (ret == 0) or it's a critical
 			 * error due to a resource shortage, and we must stop the
 			 * listener (ret < 0).
@@ -590,21 +591,19 @@ void bind_dump_kws(char **out)
 
 /* set temp integer to the number of connexions to the same listening socket */
 static int
-smp_fetch_dconn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_dconn(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	smp->type = SMP_T_UINT;
-	smp->data.uint = l4->listener->nbconn;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->sess->listener->nbconn;
 	return 1;
 }
 
 /* set temp integer to the id of the socket (listener) */
 static int
-smp_fetch_so_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_so_id(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	smp->type = SMP_T_UINT;
-	smp->data.uint = l4->listener->luid;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->sess->listener->luid;
 	return 1;
 }
 
@@ -647,6 +646,7 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind
 {
 	struct eb32_node *node;
 	struct listener *l, *new;
+	char *error;
 
 	if (conf->listeners.n != conf->listeners.p) {
 		memprintf(err, "'%s' can only be used with a single socket", args[cur_arg]);
@@ -659,7 +659,11 @@ static int bind_parse_id(char **args, int cur_arg, struct proxy *px, struct bind
 	}
 
 	new = LIST_NEXT(&conf->listeners, struct listener *, by_bind);
-	new->luid = atol(args[cur_arg + 1]);
+	new->luid = strtol(args[cur_arg + 1], &error, 10);
+	if (*error != '\0') {
+		memprintf(err, "'%s' : expects an integer argument, found '%s'", args[cur_arg], args[cur_arg + 1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
 	new->conf.id.key = new->luid;
 
 	if (new->luid <= 0) {
@@ -790,8 +794,8 @@ static int bind_parse_process(char **args, int cur_arg, struct proxy *px, struct
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct sample_fetch_kw_list smp_kws = {ILH, {
-	{ "dst_conn", smp_fetch_dconn, 0, NULL, SMP_T_UINT, SMP_USE_FTEND, },
-	{ "so_id",    smp_fetch_so_id, 0, NULL, SMP_T_UINT, SMP_USE_FTEND, },
+	{ "dst_conn", smp_fetch_dconn, 0, NULL, SMP_T_SINT, SMP_USE_FTEND, },
+	{ "so_id",    smp_fetch_so_id, 0, NULL, SMP_T_SINT, SMP_USE_FTEND, },
 	{ /* END */ },
 }};
 

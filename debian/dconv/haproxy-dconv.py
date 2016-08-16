@@ -46,10 +46,6 @@ HAPROXY_GIT_VERSION = False
 def main():
     global VERSION, HAPROXY_GIT_VERSION
 
-    VERSION = get_git_version()
-    if not VERSION:
-        sys.exit(1)
-
     usage="Usage: %prog --infile <infile> --outfile <outfile>"
 
     optparser = OptionParser(description='Generate HTML Document from HAProxy configuation.txt',
@@ -57,15 +53,25 @@ def main():
                           usage=usage)
     optparser.add_option('--infile', '-i', help='Input file mostly the configuration.txt')
     optparser.add_option('--outfile','-o', help='Output file')
+    optparser.add_option('--base','-b', default = '', help='Base directory for relative links')
     (option, args) = optparser.parse_args()
 
     if not (option.infile  and option.outfile) or len(args) > 0:
         optparser.print_help()
         exit(1)
 
+    option.infile = os.path.abspath(option.infile)
+    option.outfile = os.path.abspath(option.outfile)
+
+    os.chdir(os.path.dirname(__file__))
+
+    VERSION = get_git_version()
+    if not VERSION:
+        sys.exit(1)
+
     HAPROXY_GIT_VERSION = get_haproxy_git_version(os.path.dirname(option.infile))
 
-    convert(option.infile, option.outfile)
+    convert(option.infile, option.outfile, option.base)
 
 
 # Temporarily determine the version from git to follow which commit generated
@@ -132,8 +138,15 @@ def createLinks():
 
     print >> sys.stderr, "Generating keywords links..."
 
+    delimiters = [
+        dict(start='&quot;', end='&quot;', multi=True ),
+        dict(start='- '    , end='\n'    , multi=False),
+    ]
+
     for keyword in keywords:
-        keywordsCount[keyword] = document.count('&quot;' + keyword + '&quot;')
+        keywordsCount[keyword] = 0
+        for delimiter in delimiters:
+            keywordsCount[keyword] += document.count(delimiter['start'] + keyword + delimiter['end'])
         if (keyword in keyword_conflicts) and (not keywordsCount[keyword]):
             # The keyword is never used, we can remove it from the conflicts list
             del keyword_conflicts[keyword]
@@ -142,26 +155,34 @@ def createLinks():
             chapter_list = ""
             for chapter in keyword_conflicts[keyword]:
                 chapter_list += '<li><a href="#%s">%s</a></li>' % (quote("%s (%s)" % (keyword, chapters[chapter]['title'])), chapters[chapter]['title'])
-            document = document.replace('&quot;' + keyword + '&quot;',
-                    '&quot;<span class="dropdown">' +
-                    '<a class="dropdown-toggle" data-toggle="dropdown" href="#">' +
-                    keyword +
-                    '<span class="caret"></span>' +
-                    '</a>' +
-                    '<ul class="dropdown-menu">' +
-                    '<li class="nav-header">This keyword is available in sections :</li>' +
-                    chapter_list +
-                    '</ul>' +
-                    '</span>&quot;')
+            for delimiter in delimiters:
+                if delimiter['multi']:
+                    document = document.replace(delimiter['start'] + keyword + delimiter['end'],
+                            delimiter['start'] + '<span class="dropdown">' +
+                            '<a class="dropdown-toggle" data-toggle="dropdown" href="#">' +
+                            keyword +
+                            '<span class="caret"></span>' +
+                            '</a>' +
+                            '<ul class="dropdown-menu">' +
+                            '<li class="dropdown-header">This keyword is available in sections :</li>' +
+                            chapter_list +
+                            '</ul>' +
+                            '</span>' + delimiter['end'])
+                else:
+                    document = document.replace(delimiter['start'] + keyword + delimiter['end'], delimiter['start'] + '<a href="#' + quote(keyword) + '">' + keyword + '</a>' + delimiter['end'])
         else:
-            document = document.replace('&quot;' + keyword + '&quot;', '&quot;<a href="#' + quote(keyword) + '">' + keyword + '</a>&quot;')
+            for delimiter in delimiters:
+                document = document.replace(delimiter['start'] + keyword + delimiter['end'], delimiter['start'] + '<a href="#' + quote(keyword) + '">' + keyword + '</a>' + delimiter['end'])
         if keyword.startswith("option "):
             shortKeyword = keyword[len("option "):]
-            keywordsCount[shortKeyword] = document.count('&quot;' + shortKeyword + '&quot;')
+            keywordsCount[shortKeyword] = 0
+            for delimiter in delimiters:
+                keywordsCount[keyword] += document.count(delimiter['start'] + shortKeyword + delimiter['end'])
             if (shortKeyword in keyword_conflicts) and (not keywordsCount[shortKeyword]):
             # The keyword is never used, we can remove it from the conflicts list
                 del keyword_conflicts[shortKeyword]
-            document = document.replace('&quot;' + shortKeyword + '&quot;', '&quot;<a href="#' + quote(keyword) + '">' + shortKeyword + '</a>&quot;')
+            for delimiter in delimiters:
+                document = document.replace(delimiter['start'] + shortKeyword + delimiter['start'], delimiter['start'] + '<a href="#' + quote(keyword) + '">' + shortKeyword + '</a>' + delimiter['end'])
 
 def documentAppend(text, retline = True):
     global document
@@ -181,8 +202,11 @@ def init_parsers(pctxt):
     ]
 
 # The parser itself
-def convert(infile, outfile):
+def convert(infile, outfile, base=''):
     global document, keywords, keywordsCount, chapters, keyword_conflicts
+
+    if len(base) > 0 and base[:-1] != '/':
+        base += '/'
 
     hasSummary = False
 
@@ -197,7 +221,7 @@ def convert(infile, outfile):
     pctxt = PContext(
         TemplateLookup(
             directories=[
-                os.path.join(os.path.dirname(__file__), 'templates')
+                'templates'
             ]
         )
     )
@@ -205,8 +229,9 @@ def convert(infile, outfile):
     parsers = init_parsers(pctxt)
 
     pctxt.context = {
-            'headers':      {},
-            'document':     ""
+            'headers':  {},
+            'document': "",
+            'base':     base,
     }
 
     sections = []
@@ -262,7 +287,7 @@ def convert(infile, outfile):
             currentSection["content"] = currentSection["content"] + line + "\n"
             j += 1
             if currentSection["details"]["title"] == "Summary" and line != "":
-		hasSummary = True
+                hasSummary = True
                 # Learn chapters from the summary
                 details = getTitleDetails(line)
                 if details["chapter"]:
@@ -300,6 +325,7 @@ def convert(infile, outfile):
         if (title == "Summary") or (title and not hasSummary):
             summaryTemplate = pctxt.templates.get_template('summary.html')
             documentAppend(summaryTemplate.render(
+                pctxt = pctxt,
                 chapters = chapters,
                 chapterIndexes = chapterIndexes,
             ))
@@ -335,18 +361,49 @@ def convert(infile, outfile):
             if not title:
                 lines = pctxt.get_lines()
                 pctxt.context['headers'] = {
-                        'title':        lines[1].strip(),
-                        'subtitle':     lines[2].strip(),
-                        'version':      lines[4].strip(),
-                        'author':       lines[5].strip(),
-                        'date':         lines[6].strip()
+                    'title':    '',
+                    'subtitle': '',
+                    'version':  '',
+                    'author':   '',
+                    'date':     ''
                 }
-                if HAPROXY_GIT_VERSION:
-                    pctxt.context['headers']['version'] = 'version ' + HAPROXY_GIT_VERSION
+                if re.match("^-+$", pctxt.get_line().strip()):
+                    # Try to analyze the header of the file, assuming it follows
+                    # those rules :
+                    # - it begins with a "separator line" (several '-' chars)
+                    # - then the document title
+                    # - an optional subtitle
+                    # - a new separator line
+                    # - the version
+                    # - the author
+                    # - the date
+                    pctxt.next()
+                    pctxt.context['headers']['title'] = pctxt.get_line().strip()
+                    pctxt.next()
+                    subtitle = ""
+                    while not re.match("^-+$", pctxt.get_line().strip()):
+                        subtitle += " " + pctxt.get_line().strip()
+                        pctxt.next()
+                    pctxt.context['headers']['subtitle'] += subtitle.strip()
+                    if not pctxt.context['headers']['subtitle']:
+                        # No subtitle, try to guess one from the title if it
+                        # starts with the word "HAProxy"
+                        if pctxt.context['headers']['title'].startswith('HAProxy '):
+                            pctxt.context['headers']['subtitle'] = pctxt.context['headers']['title'][8:]
+                            pctxt.context['headers']['title'] = 'HAProxy'
+                    pctxt.next()
+                    pctxt.context['headers']['version'] = pctxt.get_line().strip()
+                    pctxt.next()
+                    pctxt.context['headers']['author'] = pctxt.get_line().strip()
+                    pctxt.next()
+                    pctxt.context['headers']['date'] = pctxt.get_line().strip()
+                    pctxt.next()
+                    if HAPROXY_GIT_VERSION:
+                        pctxt.context['headers']['version'] = 'version ' + HAPROXY_GIT_VERSION
 
-                # Skip header lines
-                pctxt.eat_lines()
-                pctxt.eat_empty_lines()
+                    # Skip header lines
+                    pctxt.eat_lines()
+                    pctxt.eat_empty_lines()
 
             documentAppend('<div>', False)
 
@@ -380,7 +437,7 @@ def convert(infile, outfile):
                         del delay[-1]
                     if delay:
                         remove_indent(delay)
-                        documentAppend('<pre class="text">%s</pre>' % "\n".join(delay), False)
+                        documentAppend('<pre class="text">%s\n</pre>' % "\n".join(delay), False)
                     delay = []
                     documentAppend(line, False)
                 else:
@@ -388,7 +445,7 @@ def convert(infile, outfile):
                         del delay[-1]
                     if delay:
                         remove_indent(delay)
-                        documentAppend('<pre class="text">%s</pre>' % "\n".join(delay), False)
+                        documentAppend('<pre class="text">%s\n</pre>' % "\n".join(delay), False)
                     delay = []
                     documentAppend(line, True)
                     pctxt.next()
@@ -397,7 +454,7 @@ def convert(infile, outfile):
                 del delay[-1]
             if delay:
                 remove_indent(delay)
-                documentAppend('<pre class="text">%s</pre>' % "\n".join(delay), False)
+                documentAppend('<pre class="text">%s\n</pre>' % "\n".join(delay), False)
             delay = []
             documentAppend('</div>')
 
@@ -405,6 +462,7 @@ def convert(infile, outfile):
         summaryTemplate = pctxt.templates.get_template('summary.html')
         print chapters
         document = summaryTemplate.render(
+            pctxt = pctxt,
             chapters = chapters,
             chapterIndexes = chapterIndexes,
         ) + document
@@ -438,8 +496,9 @@ def convert(infile, outfile):
 
     template = pctxt.templates.get_template('template.html')
     try:
-	footerTemplate = pctxt.templates.get_template('footer.html')
-	footer = footerTemplate.render(
+        footerTemplate = pctxt.templates.get_template('footer.html')
+        footer = footerTemplate.render(
+            pctxt = pctxt,
             headers = pctxt.context['headers'],
             document = document,
             chapters = chapters,
@@ -449,14 +508,16 @@ def convert(infile, outfile):
             keyword_conflicts = keyword_conflicts,
             version = VERSION,
             date = datetime.datetime.now().strftime("%Y/%m/%d"),
-	)
+        )
     except TopLevelLookupException:
-	footer = ""
+        footer = ""
 
     fd = open(outfile,'w')
 
     print >> fd, template.render(
+            pctxt = pctxt,
             headers = pctxt.context['headers'],
+            base = base,
             document = document,
             chapters = chapters,
             chapterIndexes = chapterIndexes,

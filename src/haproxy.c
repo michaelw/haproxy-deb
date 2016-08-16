@@ -1,6 +1,6 @@
 /*
  * HA-Proxy : High Availability-enabled HTTP/TCP proxy
- * Copyright 2000-2014  Willy Tarreau <w@1wt.eu>.
+ * Copyright 2000-2016 Willy Tarreau <willy@haproxy.org>.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -25,6 +25,7 @@
  *
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -47,16 +48,17 @@
 #include <syslog.h>
 #include <grp.h>
 #ifdef USE_CPU_AFFINITY
-#define __USE_GNU
 #include <sched.h>
-#undef __USE_GNU
+#ifdef __FreeBSD__
+#include <sys/param.h>
+#include <sys/cpuset.h>
+#endif
 #endif
 
 #ifdef DEBUG_FULL
 #include <assert.h>
 #endif
 
-#include <common/appsession.h>
 #include <common/base64.h>
 #include <common/cfgparse.h>
 #include <common/chunk.h>
@@ -66,6 +68,7 @@
 #include <common/errors.h>
 #include <common/memory.h>
 #include <common/mini-clist.h>
+#include <common/namespace.h>
 #include <common/regex.h>
 #include <common/standard.h>
 #include <common/time.h>
@@ -74,19 +77,20 @@
 
 #include <types/capture.h>
 #include <types/global.h>
-#include <types/proto_tcp.h>
 #include <types/acl.h>
 #include <types/peers.h>
 
-#include <proto/auth.h>
 #include <proto/acl.h>
+#include <proto/applet.h>
 #include <proto/arg.h>
+#include <proto/auth.h>
 #include <proto/backend.h>
 #include <proto/channel.h>
 #include <proto/checks.h>
 #include <proto/connection.h>
 #include <proto/fd.h>
 #include <proto/hdr_idx.h>
+#include <proto/hlua.h>
 #include <proto/listener.h>
 #include <proto/log.h>
 #include <proto/pattern.h>
@@ -96,15 +100,21 @@
 #include <proto/queue.h>
 #include <proto/server.h>
 #include <proto/session.h>
+#include <proto/stream.h>
 #include <proto/signal.h>
 #include <proto/task.h>
-
-#ifdef CONFIG_HAP_CTTPROXY
-#include <proto/cttproxy.h>
-#endif
+#include <proto/dns.h>
 
 #ifdef USE_OPENSSL
 #include <proto/ssl_sock.h>
+#endif
+
+#ifdef USE_DEVICEATLAS
+#include <import/da.h>
+#endif
+
+#ifdef USE_51DEGREES
+#include <import/51d.h>
 #endif
 
 /*********************************************************************/
@@ -123,7 +133,7 @@ struct global global = {
 	.nbproc = 1,
 	.req_count = 0,
 	.logsrvs = LIST_HEAD_INIT(global.logsrvs),
-#ifdef DEFAULT_MAXZLIBMEM
+#if defined(USE_ZLIB) && defined(DEFAULT_MAXZLIBMEM)
 	.maxzlibmem = DEFAULT_MAXZLIBMEM * 1024U * 1024U,
 #else
 	.maxzlibmem = 0,
@@ -139,14 +149,17 @@ struct global global = {
 	},
 	.tune = {
 		.bufsize = BUFSIZE,
-		.maxrewrite = MAXREWRITE,
+		.maxrewrite = -1,
 		.chksize = BUFSIZE,
+		.reserved_bufs = RESERVED_BUFS,
+		.pattern_cache = DEFAULT_PAT_LRU_SIZE,
 #ifdef USE_OPENSSL
 		.sslcachesize = SSLCACHESIZE,
 		.ssl_default_dh_param = SSL_DEFAULT_DH_PARAM,
 #ifdef DEFAULT_SSL_MAX_RECORD
 		.ssl_max_record = DEFAULT_SSL_MAX_RECORD,
 #endif
+		.ssl_ctx_cache = DEFAULT_SSL_CTX_CACHE,
 #endif
 #ifdef USE_ZLIB
 		.zlibmemlevel = 8,
@@ -163,6 +176,28 @@ struct global global = {
 #ifdef DEFAULT_MAXSSLCONN
 	.maxsslconn = DEFAULT_MAXSSLCONN,
 #endif
+#endif
+#ifdef USE_DEVICEATLAS
+	.deviceatlas = {
+		.loglevel = 0,
+		.jsonpath = 0,
+		.cookiename = 0,
+		.cookienamelen = 0,
+		.useragentid = 0,
+		.daset = 0,
+		.separator = '|',
+	},
+#endif
+#ifdef USE_51DEGREES
+	._51degrees = {
+		.property_separator = ',',
+		.property_names = LIST_HEAD_INIT(global._51degrees.property_names),
+		.data_file_path = NULL,
+#ifdef FIFTYONEDEGREES_H_PATTERN_INCLUDED
+		.data_set = { },
+#endif
+		.cache_size = 0,
+	},
 #endif
 	/* others NULL OK */
 };
@@ -216,7 +251,7 @@ unsigned int warned = 0;
 void display_version()
 {
 	printf("HA-Proxy version " HAPROXY_VERSION " " HAPROXY_DATE"\n");
-	printf("Copyright 2000-2015 Willy Tarreau <willy@haproxy.org>\n\n");
+	printf("Copyright 2000-2016 Willy Tarreau <willy@haproxy.org>\n\n");
 }
 
 void display_build_opts()
@@ -252,15 +287,17 @@ void display_build_opts()
 
 #ifdef USE_ZLIB
 	printf("Built with zlib version : " ZLIB_VERSION "\n");
+#elif defined(USE_SLZ)
+	printf("Built with libslz for stateless compression.\n");
 #else /* USE_ZLIB */
-	printf("Built without zlib support (USE_ZLIB not set)\n");
+	printf("Built without compression support (neither USE_ZLIB nor USE_SLZ are set)\n");
 #endif
 	printf("Compression algorithms supported :");
 	{
 		int i;
 
-		for (i = 0; comp_algos[i].name; i++) {
-			printf("%s %s", (i == 0 ? "" : ","), comp_algos[i].name);
+		for (i = 0; comp_algos[i].cfg_name; i++) {
+			printf("%s %s(\"%s\")", (i == 0 ? "" : ","), comp_algos[i].cfg_name, comp_algos[i].ua_name);
 		}
 		if (i == 0) {
 			printf("none");
@@ -269,10 +306,15 @@ void display_build_opts()
 	printf("\n");
 
 #ifdef USE_OPENSSL
-	printf("Built with OpenSSL version : " OPENSSL_VERSION_TEXT "\n");
+	printf("Built with OpenSSL version : "
+#ifdef OPENSSL_IS_BORINGSSL
+	       "BoringSSL\n");
+#else /* OPENSSL_IS_BORINGSSL */
+	        OPENSSL_VERSION_TEXT "\n");
 	printf("Running on OpenSSL version : %s%s\n",
 	       SSLeay_version(SSLEAY_VERSION),
 	       ((OPENSSL_VERSION_NUMBER ^ SSLeay()) >> 8) ? " (VERSIONS DIFFER!)" : "");
+#endif
 	printf("OpenSSL library supports TLS extensions : "
 #if OPENSSL_VERSION_NUMBER < 0x00907000L
 	       "no (library version too old)"
@@ -324,11 +366,14 @@ void display_build_opts()
 	printf("Built without PCRE support (using libc's regex instead)\n");
 #endif
 
-#if defined(CONFIG_HAP_TRANSPARENT) || defined(CONFIG_HAP_CTTPROXY)
-	printf("Built with transparent proxy support using:"
-#if defined(CONFIG_HAP_CTTPROXY)
-	       " CTTPROXY"
+#ifdef USE_LUA
+	printf("Built with Lua version : %s\n", LUA_RELEASE);
+#else
+	printf("Built without Lua support\n");
 #endif
+
+#if defined(CONFIG_HAP_TRANSPARENT)
+	printf("Built with transparent proxy support using:"
 #if defined(IP_TRANSPARENT)
 	       " IP_TRANSPARENT"
 #endif
@@ -349,6 +394,17 @@ void display_build_opts()
 #endif
 	       "\n");
 #endif
+
+#if defined(CONFIG_HAP_NS)
+	printf("Built with network namespace support\n");
+#endif
+
+#ifdef USE_DEVICEATLAS
+    printf("Built with DeviceAtlas support\n");
+#endif
+#ifdef USE_51DEGREES
+	printf("Built with 51Degrees support\n");
+#endif
 	putchar('\n');
 
 	list_pollers(stdout);
@@ -364,7 +420,7 @@ void usage(char *name)
 	fprintf(stderr,
 		"Usage : %s [-f <cfgfile>]* [ -vdV"
 		"D ] [ -n <maxconn> ] [ -N <maxpconn> ]\n"
-		"        [ -p <pidfile> ] [ -m <max megs> ] [ -C <dir> ]\n"
+		"        [ -p <pidfile> ] [ -m <max megs> ] [ -C <dir> ] [-- <cfgfile>*]\n"
 		"        -v displays version ; -vv shows known build options.\n"
 		"        -d enters debug mode ; -db only disables background mode.\n"
 		"        -dM[<byte>] poisons memory with <byte> (defaults to 0x50)\n"
@@ -393,7 +449,7 @@ void usage(char *name)
 		"        -dG disables getaddrinfo() usage\n"
 #endif
 		"        -dV disables SSL verify on servers side\n"
-		"        -sf/-st [pid ]* finishes/terminates old pids. Must be last arguments.\n"
+		"        -sf/-st [pid ]* finishes/terminates old pids.\n"
 		"\n",
 		name, DEFAULT_MAXCONN, cfg_maxpconn);
 	exit(1);
@@ -503,7 +559,6 @@ void init(int argc, char **argv)
 	struct wordlist *wl;
 	char *progname;
 	char *change_dir = NULL;
-	struct tm curtime;
 
 	chunk_init(&trash, malloc(global.tune.bufsize), global.tune.bufsize);
 	alloc_trash_buffers(global.tune.bufsize);
@@ -525,27 +580,28 @@ void init(int argc, char **argv)
     
 
 #ifdef HAPROXY_MEMMAX
-	global.rlimit_memmax = HAPROXY_MEMMAX;
+	global.rlimit_memmax_all = HAPROXY_MEMMAX;
 #endif
 
+	tzset();
 	tv_update_date(-1,-1);
 	start_date = now;
 
 	srandom(now_ms - getpid());
 
-	/* Get the numeric timezone. */
-	get_localtime(start_date.tv_sec, &curtime);
-	strftime(localtimezone, 6, "%z", &curtime);
-
 	signal_init();
 	if (init_acl() != 0)
 		exit(1);
 	init_task();
+	init_stream();
 	init_session();
 	init_connection();
 	/* warning, we init buffers later */
 	init_pendconn();
 	init_proto_http();
+
+	/* Initialise lua. */
+	hlua_init();
 
 	global.tune.options |= GTUNE_USE_SELECT;  /* select() is always available */
 #if defined(ENABLE_POLL)
@@ -570,7 +626,7 @@ void init(int argc, char **argv)
 		progname = tmp + 1;
 
 	/* the process name is used for the logs only */
-	global.log_tag = strdup(progname);
+	chunk_initstr(&global.log_tag, strdup(progname));
 
 	argc--; argv++;
 	while (argc > 0) {
@@ -632,18 +688,34 @@ void init(int argc, char **argv)
 					oldpids_sig = SIGUSR1; /* finish then exit */
 				else
 					oldpids_sig = SIGTERM; /* terminate immediately */
-				argv++; argc--;
 
-				if (argc > 0) {
-					oldpids = calloc(argc, sizeof(int));
-					while (argc > 0) {
-						oldpids[nb_oldpids] = atol(*argv);
-						if (oldpids[nb_oldpids] <= 0)
-							usage(progname);
-						argc--; argv++;
-						nb_oldpids++;
+				while (argc > 1 && argv[1][0] != '-') {
+					oldpids = realloc(oldpids, (nb_oldpids + 1) * sizeof(int));
+					if (!oldpids) {
+						Alert("Cannot allocate old pid : out of memory.\n");
+						exit(1);
 					}
+					argc--; argv++;
+					oldpids[nb_oldpids] = atol(*argv);
+					if (oldpids[nb_oldpids] <= 0)
+						usage(progname);
+					nb_oldpids++;
 				}
+			}
+			else if (flag[0] == '-' && flag[1] == 0) { /* "--" */
+				/* now that's a cfgfile list */
+				argv++; argc--;
+				while (argc > 0) {
+					wl = (struct wordlist *)calloc(1, sizeof(*wl));
+					if (!wl) {
+						Alert("Cannot load configuration file %s : out of memory.\n", *argv);
+						exit(1);
+					}
+					wl->s = *argv;
+					LIST_ADDQ(&cfg_cfgfiles, &wl->list);
+					argv++; argc--;
+				}
+				break;
 			}
 			else { /* >=2 args */
 				argv++; argc--;
@@ -653,7 +725,7 @@ void init(int argc, char **argv)
 				switch (*flag) {
 				case 'C' : change_dir = *argv; break;
 				case 'n' : cfg_maxconn = atol(*argv); break;
-				case 'm' : global.rlimit_memmax = atol(*argv); break;
+				case 'm' : global.rlimit_memmax_all = atol(*argv); break;
 				case 'N' : cfg_maxpconn = atol(*argv); break;
 				case 'L' : strncpy(localpeer, *argv, sizeof(localpeer) - 1); break;
 				case 'f' :
@@ -687,7 +759,6 @@ void init(int argc, char **argv)
 		exit(1);
 	}
 
-	have_appsession = 0;
 	global.maxsock = 10; /* reserve 10 fds ; will be incremented by socket eaters */
 
 	init_default_instance();
@@ -709,12 +780,39 @@ void init(int argc, char **argv)
 	}
 
 	pattern_finalize_config();
+#if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
+	tlskeys_finalize_config();
+#endif
 
 	err_code |= check_config_validity();
 	if (err_code & (ERR_ABORT|ERR_FATAL)) {
 		Alert("Fatal errors found in configuration.\n");
 		exit(1);
 	}
+
+	/* recompute the amount of per-process memory depending on nbproc and
+	 * the shared SSL cache size (allowed to exist in all processes).
+	 */
+	if (global.rlimit_memmax_all) {
+#if defined (USE_OPENSSL) && !defined(USE_PRIVATE_CACHE)
+		int64_t ssl_cache_bytes = global.tune.sslcachesize * 200LL;
+
+		global.rlimit_memmax =
+			((((int64_t)global.rlimit_memmax_all * 1048576LL) -
+			  ssl_cache_bytes) / global.nbproc +
+			 ssl_cache_bytes + 1048575LL) / 1048576LL;
+#else
+		global.rlimit_memmax = global.rlimit_memmax_all / global.nbproc;
+#endif
+	}
+
+#ifdef CONFIG_HAP_NS
+        err_code |= netns_init();
+        if (err_code & (ERR_ABORT|ERR_FATAL)) {
+                Alert("Failed to initialize namespace support.\n");
+                exit(1);
+        }
+#endif
 
 	if (global.mode & MODE_CHECK) {
 		struct peers *pr;
@@ -737,6 +835,9 @@ void init(int argc, char **argv)
 		exit(2);
 	}
 
+	/* Apply server states */
+	apply_server_state();
+
 	global_listener_queue_task = task_new();
 	if (!global_listener_queue_task) {
 		Alert("Out of memory when initializing global task\n");
@@ -748,11 +849,13 @@ void init(int argc, char **argv)
 	global_listener_queue_task->expire = TICK_ETERNITY;
 
 	/* now we know the buffer size, we can initialize the channels and buffers */
-	init_channel();
 	init_buffer();
-
-	if (have_appsession)
-		appsession_init();
+#if defined(USE_DEVICEATLAS)
+	init_deviceatlas();
+#endif
+#ifdef USE_51DEGREES
+	init_51degrees();
+#endif
 
 	if (start_checks() < 0)
 		exit(1);
@@ -765,8 +868,146 @@ void init(int argc, char **argv)
 		global.pidfile = strdup(cfg_pidfile);
 	}
 
-	if (global.maxconn == 0)
-		global.maxconn = DEFAULT_MAXCONN;
+	/* Now we want to compute the maxconn and possibly maxsslconn values.
+	 * It's a bit tricky. If memmax is not set, maxconn defaults to
+	 * DEFAULT_MAXCONN and maxsslconn defaults to DEFAULT_MAXSSLCONN.
+	 *
+	 * If memmax is set, then it depends on which values are set. If
+	 * maxsslconn is set, we use memmax to determine how many cleartext
+	 * connections may be added, and set maxconn to the sum of the two.
+	 * If maxconn is set and not maxsslconn, maxsslconn is computed from
+	 * the remaining amount of memory between memmax and the cleartext
+	 * connections. If neither are set, then it is considered that all
+	 * connections are SSL-capable, and maxconn is computed based on this,
+	 * then maxsslconn accordingly. We need to know if SSL is used on the
+	 * frontends, backends, or both, because when it's used on both sides,
+	 * we need twice the value for maxsslconn, but we only count the
+	 * handshake once since it is not performed on the two sides at the
+	 * same time (frontend-side is terminated before backend-side begins).
+	 * The SSL stack is supposed to have filled ssl_session_cost and
+	 * ssl_handshake_cost during its initialization. In any case, if
+	 * SYSTEM_MAXCONN is set, we still enforce it as an upper limit for
+	 * maxconn in order to protect the system.
+	 */
+	if (!global.rlimit_memmax) {
+		if (global.maxconn == 0) {
+			global.maxconn = DEFAULT_MAXCONN;
+			if (global.mode & (MODE_VERBOSE|MODE_DEBUG))
+				fprintf(stderr, "Note: setting global.maxconn to %d.\n", global.maxconn);
+		}
+	}
+#ifdef USE_OPENSSL
+	else if (!global.maxconn && !global.maxsslconn &&
+		 (global.ssl_used_frontend || global.ssl_used_backend)) {
+		/* memmax is set, compute everything automatically. Here we want
+		 * to ensure that all SSL connections will be served. We take
+		 * care of the number of sides where SSL is used, and consider
+		 * the worst case : SSL used on both sides and doing a handshake
+		 * simultaneously. Note that we can't have more than maxconn
+		 * handshakes at a time by definition, so for the worst case of
+		 * two SSL conns per connection, we count a single handshake.
+		 */
+		int sides = !!global.ssl_used_frontend + !!global.ssl_used_backend;
+		int64_t mem = global.rlimit_memmax * 1048576ULL;
+
+		mem -= global.tune.sslcachesize * 200; // about 200 bytes per SSL cache entry
+		mem -= global.maxzlibmem;
+		mem = mem * MEM_USABLE_RATIO;
+
+		global.maxconn = mem /
+			((STREAM_MAX_COST + 2 * global.tune.bufsize) +    // stream + 2 buffers per stream
+			 sides * global.ssl_session_max_cost + // SSL buffers, one per side
+			 global.ssl_handshake_max_cost);       // 1 handshake per connection max
+
+		global.maxconn = round_2dig(global.maxconn);
+#ifdef SYSTEM_MAXCONN
+		if (global.maxconn > DEFAULT_MAXCONN)
+			global.maxconn = DEFAULT_MAXCONN;
+#endif /* SYSTEM_MAXCONN */
+		global.maxsslconn = sides * global.maxconn;
+		if (global.mode & (MODE_VERBOSE|MODE_DEBUG))
+			fprintf(stderr, "Note: setting global.maxconn to %d and global.maxsslconn to %d.\n",
+			        global.maxconn, global.maxsslconn);
+	}
+	else if (!global.maxsslconn &&
+		 (global.ssl_used_frontend || global.ssl_used_backend)) {
+		/* memmax and maxconn are known, compute maxsslconn automatically.
+		 * maxsslconn being forced, we don't know how many of it will be
+		 * on each side if both sides are being used. The worst case is
+		 * when all connections use only one SSL instance because
+		 * handshakes may be on two sides at the same time.
+		 */
+		int sides = !!global.ssl_used_frontend + !!global.ssl_used_backend;
+		int64_t mem = global.rlimit_memmax * 1048576ULL;
+		int64_t sslmem;
+
+		mem -= global.tune.sslcachesize * 200; // about 200 bytes per SSL cache entry
+		mem -= global.maxzlibmem;
+		mem = mem * MEM_USABLE_RATIO;
+
+		sslmem = mem - global.maxconn * (int64_t)(STREAM_MAX_COST + 2 * global.tune.bufsize);
+		global.maxsslconn = sslmem / (global.ssl_session_max_cost + global.ssl_handshake_max_cost);
+		global.maxsslconn = round_2dig(global.maxsslconn);
+
+		if (sslmem <= 0 || global.maxsslconn < sides) {
+			Alert("Cannot compute the automatic maxsslconn because global.maxconn is already too "
+			      "high for the global.memmax value (%d MB). The absolute maximum possible value "
+			      "without SSL is %d, but %d was found and SSL is in use.\n",
+			      global.rlimit_memmax,
+			      (int)(mem / (STREAM_MAX_COST + 2 * global.tune.bufsize)),
+			      global.maxconn);
+			exit(1);
+		}
+
+		if (global.maxsslconn > sides * global.maxconn)
+			global.maxsslconn = sides * global.maxconn;
+
+		if (global.mode & (MODE_VERBOSE|MODE_DEBUG))
+			fprintf(stderr, "Note: setting global.maxsslconn to %d\n", global.maxsslconn);
+	}
+#endif
+	else if (!global.maxconn) {
+		/* memmax and maxsslconn are known/unused, compute maxconn automatically */
+		int sides = !!global.ssl_used_frontend + !!global.ssl_used_backend;
+		int64_t mem = global.rlimit_memmax * 1048576ULL;
+		int64_t clearmem;
+
+		if (global.ssl_used_frontend || global.ssl_used_backend)
+			mem -= global.tune.sslcachesize * 200; // about 200 bytes per SSL cache entry
+
+		mem -= global.maxzlibmem;
+		mem = mem * MEM_USABLE_RATIO;
+
+		clearmem = mem;
+		if (sides)
+			clearmem -= (global.ssl_session_max_cost + global.ssl_handshake_max_cost) * (int64_t)global.maxsslconn;
+
+		global.maxconn = clearmem / (STREAM_MAX_COST + 2 * global.tune.bufsize);
+		global.maxconn = round_2dig(global.maxconn);
+#ifdef SYSTEM_MAXCONN
+		if (global.maxconn > DEFAULT_MAXCONN)
+			global.maxconn = DEFAULT_MAXCONN;
+#endif /* SYSTEM_MAXCONN */
+
+		if (clearmem <= 0 || !global.maxconn) {
+			Alert("Cannot compute the automatic maxconn because global.maxsslconn is already too "
+			      "high for the global.memmax value (%d MB). The absolute maximum possible value "
+			      "is %d, but %d was found.\n",
+			      global.rlimit_memmax,
+			      (int)(mem / (global.ssl_session_max_cost + global.ssl_handshake_max_cost)),
+			      global.maxsslconn);
+			exit(1);
+		}
+
+		if (global.mode & (MODE_VERBOSE|MODE_DEBUG)) {
+			if (sides && global.maxsslconn > sides * global.maxconn) {
+				fprintf(stderr, "Note: global.maxsslconn is forced to %d which causes global.maxconn "
+				        "to be limited to %d. Better reduce global.maxsslconn to get more "
+				        "room for extra connections.\n", global.maxsslconn, global.maxconn);
+			}
+			fprintf(stderr, "Note: setting global.maxconn to %d\n", global.maxconn);
+		}
+	}
 
 	if (!global.maxpipes) {
 		/* maxpipes not specified. Count how many frontends and backends
@@ -812,6 +1053,9 @@ void init(int argc, char **argv)
 	if (global.tune.recv_enough == 0)
 		global.tune.recv_enough = MIN_RECV_AT_ONCE_ENOUGH;
 
+	if (global.tune.maxrewrite < 0)
+		global.tune.maxrewrite = MAXREWRITE;
+
 	if (global.tune.maxrewrite >= global.tune.bufsize / 2)
 		global.tune.maxrewrite = global.tune.bufsize / 2;
 
@@ -845,7 +1089,7 @@ void init(int argc, char **argv)
 
 	swap_buffer = (char *)calloc(1, global.tune.bufsize);
 	get_http_auth_buff = (char *)calloc(1, global.tune.bufsize);
-	static_table_key = calloc(1, sizeof(*static_table_key) + global.tune.bufsize);
+	static_table_key = calloc(1, sizeof(*static_table_key));
 
 	fdinfo = (struct fdinfo *)calloc(1,
 				       sizeof(struct fdinfo) * (global.maxsock));
@@ -893,6 +1137,12 @@ void init(int argc, char **argv)
 	if (!global.node)
 		global.node = strdup(hostname);
 
+	if (!hlua_post_init())
+		exit(1);
+
+	/* initialize structures for name resolution */
+	if (!dns_init_resolvers())
+		exit(1);
 }
 
 static void deinit_acl_cond(struct acl_cond *cond)
@@ -917,7 +1167,7 @@ static void deinit_acl_cond(struct acl_cond *cond)
 
 static void deinit_tcp_rules(struct list *rules)
 {
-	struct tcp_rule *trule, *truleb;
+	struct act_rule *trule, *truleb;
 
 	list_for_each_entry_safe(trule, truleb, rules, list) {
 		LIST_DEL(&trule->list);
@@ -938,6 +1188,13 @@ static void deinit_sample_arg(struct arg *p)
 			free(p->data.str.str);
 			p->data.str.str = NULL;
 			p->unresolved = 0;
+		}
+		else if (p->type == ARGT_REG) {
+			if (p->data.reg) {
+				regex_free(p->data.reg);
+				free(p->data.reg);
+				p->data.reg = NULL;
+			}
 		}
 		p++;
 	}
@@ -1005,6 +1262,10 @@ void deinit(void)
 		free(p->conf.uif_file);
 		free(p->lbprm.map.srv);
 
+		if (p->conf.logformat_sd_string != default_rfc5424_sd_log_format)
+			free(p->conf.logformat_sd_string);
+		free(p->conf.lfsd_file);
+
 		for (i = 0; i < HTTP_ERR_SIZE; i++)
 			chunk_destroy(&p->errmsg[i]);
 
@@ -1032,8 +1293,7 @@ void deinit(void)
 				free(exp->preg);
 			}
 
-			if (exp->replace && exp->action != ACT_SETBE)
-				free((char *)exp->replace);
+			free((char *)exp->replace);
 			expb = exp;
 			exp = exp->next;
 			free(expb);
@@ -1045,8 +1305,7 @@ void deinit(void)
 				free(exp->preg);
 			}
 
-			if (exp->replace && exp->action != ACT_SETBE)
-				free((char *)exp->replace);
+			free((char *)exp->replace);
 			expb = exp;
 			exp = exp->next;
 			free(expb);
@@ -1114,13 +1373,16 @@ void deinit(void)
 			free(lf);
 		}
 
+		list_for_each_entry_safe(lf, lfb, &p->logformat_sd, list) {
+			LIST_DEL(&lf->list);
+			free(lf);
+		}
+
 		deinit_tcp_rules(&p->tcp_req.inspect_rules);
 		deinit_tcp_rules(&p->tcp_req.l4_rules);
 
 		deinit_stick_rules(&p->storersp_rules);
 		deinit_stick_rules(&p->sticking_rules);
-
-		free(p->appsession_name);
 
 		h = p->req_cap;
 		while (h) {
@@ -1164,6 +1426,11 @@ void deinit(void)
 			free(s->check.bo);
 			free(s->agent.bi);
 			free(s->agent.bo);
+			free((char*)s->conf.file);
+#ifdef USE_OPENSSL
+			if (s->use_ssl || s->check.use_ssl)
+				ssl_sock_free_srv_ctx(s);
+#endif
 			free(s);
 			s = s_next;
 		}/* end while(s) */
@@ -1181,8 +1448,11 @@ void deinit(void)
 		/* Release unused SSL configs. */
 		list_for_each_entry_safe(bind_conf, bind_back, &p->conf.bind, by_fe) {
 #ifdef USE_OPENSSL
+			ssl_sock_free_ca(bind_conf);
 			ssl_sock_free_all_ctx(bind_conf);
 			free(bind_conf->ca_file);
+			free(bind_conf->ca_sign_file);
+			free(bind_conf->ca_sign_pass);
 			free(bind_conf->ciphers);
 			free(bind_conf->ecdhe);
 			free(bind_conf->crl_file);
@@ -1226,10 +1496,23 @@ void deinit(void)
 
 	userlist_free(userlist);
 
+	cfg_unregister_sections();
+
+	free_trash_buffers();
+	chunk_destroy(&trash);
+
 	protocol_unbind_all();
 
+#if defined(USE_DEVICEATLAS)
+	deinit_deviceatlas();
+#endif
+
+#ifdef USE_51DEGREES
+	deinit_51degrees();
+#endif
+
 	free(global.log_send_hostname); global.log_send_hostname = NULL;
-	free(global.log_tag); global.log_tag = NULL;
+	chunk_destroy(&global.log_tag);
 	free(global.chroot);  global.chroot = NULL;
 	free(global.pidfile); global.pidfile = NULL;
 	free(global.node);    global.node = NULL;
@@ -1237,6 +1520,9 @@ void deinit(void)
 	free(fdinfo);         fdinfo  = NULL;
 	free(fdtab);          fdtab   = NULL;
 	free(oldpids);        oldpids = NULL;
+	free(static_table_key); static_table_key = NULL;
+	free(get_http_auth_buff); get_http_auth_buff = NULL;
+	free(swap_buffer);    swap_buffer = NULL;
 	free(global_listener_queue_task); global_listener_queue_task = NULL;
 
 	list_for_each_entry_safe(log, logb, &global.logsrvs, list) {
@@ -1248,23 +1534,18 @@ void deinit(void)
 		free(wl);
 	}
 
+	pool_destroy2(pool2_stream);
 	pool_destroy2(pool2_session);
 	pool_destroy2(pool2_connection);
 	pool_destroy2(pool2_buffer);
-	pool_destroy2(pool2_channel);
 	pool_destroy2(pool2_requri);
 	pool_destroy2(pool2_task);
 	pool_destroy2(pool2_capture);
-	pool_destroy2(pool2_appsess);
 	pool_destroy2(pool2_pendconn);
 	pool_destroy2(pool2_sig_handlers);
 	pool_destroy2(pool2_hdr_idx);
+	pool_destroy2(pool2_http_txn);
     
-	if (have_appsession) {
-		pool_destroy2(apools.serverid);
-		pool_destroy2(apools.sessid);
-	}
-
 	deinit_pollers();
 } /* end deinit() */
 
@@ -1288,22 +1569,27 @@ void run_poll_loop()
 
 	tv_update_date(0,1);
 	while (1) {
+		/* Process a few tasks */
+		process_runnable_tasks();
+
 		/* check if we caught some signals and process them */
 		signal_process_queue();
 
 		/* Check if we can expire some tasks */
-		wake_expired_tasks(&next);
-
-		/* Process a few tasks */
-		process_runnable_tasks(&next);
+		next = wake_expired_tasks();
 
 		/* stop when there's nothing left to do */
 		if (jobs == 0)
 			break;
 
+		/* expire immediately if events are pending */
+		if (fd_cache_num || run_queue || signal_queue_len || !LIST_ISEMPTY(&applet_active_queue))
+			next = now_ms;
+
 		/* The poller will ensure it returns around <next> */
 		cur_poller.poll(&cur_poller, next);
 		fd_process_cached_events();
+		applet_run_active();
 	}
 }
 
@@ -1364,13 +1650,20 @@ int main(int argc, char **argv)
 	if (global.rlimit_nofile) {
 		limit.rlim_cur = limit.rlim_max = global.rlimit_nofile;
 		if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
-			Warning("[%s.main()] Cannot raise FD limit to %d.\n", argv[0], global.rlimit_nofile);
+			/* try to set it to the max possible at least */
+			getrlimit(RLIMIT_NOFILE, &limit);
+			limit.rlim_cur = limit.rlim_max;
+			if (setrlimit(RLIMIT_NOFILE, &limit) != -1)
+				getrlimit(RLIMIT_NOFILE, &limit);
+
+			Warning("[%s.main()] Cannot raise FD limit to %d, limit is %d.\n", argv[0], global.rlimit_nofile, (int)limit.rlim_cur);
+			global.rlimit_nofile = limit.rlim_cur;
 		}
 	}
 
 	if (global.rlimit_memmax) {
 		limit.rlim_cur = limit.rlim_max =
-			global.rlimit_memmax * 1048576 / global.nbproc;
+			global.rlimit_memmax * 1048576ULL;
 #ifdef RLIMIT_AS
 		if (setrlimit(RLIMIT_AS, &limit) == -1) {
 			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
@@ -1425,7 +1718,7 @@ int main(int argc, char **argv)
 	}
 
 	if (listeners == 0) {
-		Alert("[%s.main()] No enabled listener found (check the <listen> keywords) ! Exiting.\n", argv[0]);
+		Alert("[%s.main()] No enabled listener found (check for 'bind' directives) ! Exiting.\n", argv[0]);
 		/* Note: we don't have to send anything to the old pids because we
 		 * never stopped them. */
 		exit(1);
@@ -1469,22 +1762,6 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 	}
-
-#ifdef CONFIG_HAP_CTTPROXY
-	if (global.last_checks & LSTCHK_CTTPROXY) {
-		int ret;
-
-		ret = check_cttproxy_version();
-		if (ret < 0) {
-			Alert("[%s.main()] Cannot enable cttproxy.\n%s",
-			      argv[0],
-			      (ret == -1) ? "  Incorrect module version.\n"
-			      : "  Make sure you have enough permissions and that the module is loaded.\n");
-			protocol_unbind_all();
-			exit(1);
-		}
-	}
-#endif
 
 	if ((global.last_checks & LSTCHK_NETADM) && global.uid) {
 		Alert("[%s.main()] Some configuration options require full privileges, so global.uid cannot be changed.\n"
@@ -1576,7 +1853,11 @@ int main(int argc, char **argv)
 		if (proc < global.nbproc &&  /* child */
 		    proc < LONGBITS &&       /* only the first 32/64 processes may be pinned */
 		    global.cpu_map[proc])    /* only do this if the process has a CPU map */
+#ifdef __FreeBSD__
+			cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(unsigned long), (void *)&global.cpu_map[proc]);
+#else
 			sched_setaffinity(0, sizeof(unsigned long), (void *)&global.cpu_map[proc]);
+#endif
 #endif
 		/* close the pidfile both in children and father */
 		if (pidfd >= 0) {
@@ -1618,6 +1899,12 @@ int main(int argc, char **argv)
 
 			stop_proxy(curpeers->peers_fe);
 			/* disable this peer section so that it kills itself */
+			signal_unregister_handler(curpeers->sighandler);
+			task_delete(curpeers->sync_task);
+			task_free(curpeers->sync_task);
+			curpeers->sync_task = NULL;
+			task_free(curpeers->peers_fe->task);
+			curpeers->peers_fe->task = NULL;
 			curpeers->peers_fe = NULL;
 		}
 
@@ -1645,8 +1932,6 @@ int main(int argc, char **argv)
 	 */
 	run_poll_loop();
 
-	/* Free all Hash Keys and all Hash elements */
-	appsession_cleanup();
 	/* Do some cleanup */ 
 	deinit();
     

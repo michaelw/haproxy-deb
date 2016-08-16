@@ -1,5 +1,6 @@
 #!/usr/bin/make -f
 
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
 
 MAKEARGS=DESTDIR=debian/haproxy \
@@ -9,7 +10,9 @@ MAKEARGS=DESTDIR=debian/haproxy \
 	 DOCDIR=/usr/share/doc/haproxy \
 	 USE_PCRE=1 PCREDIR= \
 	 USE_OPENSSL=1 \
-	 USE_ZLIB=1
+	 USE_ZLIB=1 \
+	 USE_LUA=1 \
+	 LUA_INC=/usr/include/lua5.3
 
 OS_TYPE = $(shell dpkg-architecture -qDEB_HOST_ARCH_OS)
 
@@ -21,7 +24,9 @@ else
 	MAKEARGS+= TARGET=generic
 endif
 
-ifeq ($(shell dpkg-architecture -qDEB_HOST_ARCH_CPU),i386)
+ifneq ($(filter amd64 i386, $(shell dpkg-architecture -qDEB_HOST_ARCH_CPU)),)
+	MAKEARGS+= USE_REGPARM=1
+else ifeq ($(shell dpkg-architecture -qDEB_HOST_ARCH_CPU),amd64)
 	MAKEARGS+= USE_REGPARM=1
 endif
 
@@ -33,36 +38,23 @@ MAKEARGS += LDFLAGS="$(shell dpkg-buildflags --get LDFLAGS)"
 
 override_dh_auto_configure:
 
-override_dh_auto_build-arch:
+override_dh_auto_build:
 	make $(MAKEARGS)
-#	make -C contrib/systemd $(MAKEARGS)
+	make -C contrib/systemd $(MAKEARGS)
 	dh_auto_build -Dcontrib/halog
 
-override_dh_auto_build-indep:
-	# Build the HTML documentation, after patching dconv
-	patch -p1 < $(CURDIR)/debian/patches/debianize-dconv.patch
-	python -B $(CURDIR)/debian/dconv/haproxy-dconv.py \
-		-i $(CURDIR)/doc/configuration.txt \
-		-o $(CURDIR)/doc/configuration.html
-	patch -p1 -R < $(CURDIR)/debian/patches/debianize-dconv.patch
-
 override_dh_auto_clean:
-#	make -C contrib/systemd clean
+	make -C contrib/systemd clean
 	dh_auto_clean
 	dh_auto_clean -Dcontrib/halog
-	-rm $(CURDIR)/doc/configuration.html
 
-override_dh_auto_install-arch:
+override_dh_auto_install:
 	make $(MAKEARGS) install
 	install -m 0644 -D debian/rsyslog.conf debian/haproxy/etc/rsyslog.d/49-haproxy.conf
 	install -m 0644 -D debian/logrotate.conf debian/haproxy/etc/logrotate.d/haproxy
 
-override_dh_auto_install-indep:
-
 override_dh_installdocs:
 	dh_installdocs -Xsystemd/ -Xhalog/
-	rm -f debian/haproxy/usr/share/doc/haproxy/haproxy-fr.txt
-	rm -f debian/haproxy/usr/share/doc/haproxy/haproxy-en.txt
 
 override_dh_installexamples:
 	dh_installexamples -X build.cfg

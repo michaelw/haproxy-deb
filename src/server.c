@@ -12,22 +12,28 @@
  */
 
 #include <ctype.h>
+#include <errno.h>
 
 #include <common/cfgparse.h>
 #include <common/config.h>
 #include <common/errors.h>
+#include <common/namespace.h>
 #include <common/time.h>
 
 #include <types/global.h>
+#include <types/dns.h>
 
+#include <proto/checks.h>
 #include <proto/port_range.h>
 #include <proto/protocol.h>
 #include <proto/queue.h>
 #include <proto/raw_sock.h>
 #include <proto/server.h>
-#include <proto/session.h>
+#include <proto/stream.h>
 #include <proto/task.h>
+#include <proto/dns.h>
 
+static void srv_update_state(struct server *srv, int version, char **params);
 
 /* List head of all known server keywords */
 static struct srv_kw_list srv_keywords = {
@@ -157,33 +163,34 @@ static int srv_parse_id(char **args, int *cur_arg, struct proxy *curproxy, struc
 	}
 
 	eb32_insert(&curproxy->conf.used_server_id, &newsrv->conf.id);
+	newsrv->flags |= SRV_F_FORCED_ID;
 	return 0;
 }
 
 /* Shutdown all connections of a server. The caller must pass a termination
- * code in <why>, which must be one of SN_ERR_* indicating the reason for the
+ * code in <why>, which must be one of SF_ERR_* indicating the reason for the
  * shutdown.
  */
-void srv_shutdown_sessions(struct server *srv, int why)
+void srv_shutdown_streams(struct server *srv, int why)
 {
-	struct session *session, *session_bck;
+	struct stream *stream, *stream_bck;
 
-	list_for_each_entry_safe(session, session_bck, &srv->actconns, by_srv)
-		if (session->srv_conn == srv)
-			session_shutdown(session, why);
+	list_for_each_entry_safe(stream, stream_bck, &srv->actconns, by_srv)
+		if (stream->srv_conn == srv)
+			stream_shutdown(stream, why);
 }
 
 /* Shutdown all connections of all backup servers of a proxy. The caller must
- * pass a termination code in <why>, which must be one of SN_ERR_* indicating
+ * pass a termination code in <why>, which must be one of SF_ERR_* indicating
  * the reason for the shutdown.
  */
-void srv_shutdown_backup_sessions(struct proxy *px, int why)
+void srv_shutdown_backup_streams(struct proxy *px, int why)
 {
 	struct server *srv;
 
 	for (srv = px->srv; srv != NULL; srv = srv->next)
 		if (srv->flags & SRV_F_BACKUP)
-			srv_shutdown_sessions(srv, why);
+			srv_shutdown_streams(srv, why);
 }
 
 /* Appends some information to a message string related to a server going UP or
@@ -191,7 +198,7 @@ void srv_shutdown_backup_sessions(struct proxy *px, int why)
  * one, a "via" information will be provided to know where the status came from.
  * If <reason> is non-null, the entire string will be appended after a comma and
  * a space (eg: to report some information from the check that changed the state).
- * If <xferred> is non-negative, some information about requeued sessions are
+ * If <xferred> is non-negative, some information about requeued streams are
  * provided.
  */
 void srv_append_status(struct chunk *msg, struct server *s, const char *reason, int xferred, int forced)
@@ -219,7 +226,7 @@ void srv_append_status(struct chunk *msg, struct server *s, const char *reason, 
 
 /* Marks server <s> down, regardless of its checks' statuses, notifies by all
  * available means, recounts the remaining servers on the proxy and transfers
- * queued sessions whenever possible to other servers. It automatically
+ * queued streams whenever possible to other servers. It automatically
  * recomputes the number of servers, but not the map. Maintenance servers are
  * ignored. It reports <reason> if non-null as the reason for going down. Note
  * that it makes use of the trash to build the log strings, so <reason> must
@@ -230,6 +237,7 @@ void srv_set_stopped(struct server *s, const char *reason)
 	struct server *srv;
 	int prev_srv_count = s->proxy->srv_bck + s->proxy->srv_act;
 	int srv_was_stopping = (s->state == SRV_ST_STOPPING);
+	int log_level;
 	int xferred;
 
 	if ((s->admin & SRV_ADMF_MAINT) || s->state == SRV_ST_STOPPED)
@@ -241,9 +249,9 @@ void srv_set_stopped(struct server *s, const char *reason)
 		s->proxy->lbprm.set_server_status_down(s);
 
 	if (s->onmarkeddown & HANA_ONMARKEDDOWN_SHUTDOWNSESSIONS)
-		srv_shutdown_sessions(s, SN_ERR_DOWN);
+		srv_shutdown_streams(s, SF_ERR_DOWN);
 
-	/* we might have sessions queued on this server and waiting for
+	/* we might have streams queued on this server and waiting for
 	 * a connection. Those which are redispatchable will be queued
 	 * to another server or to the proxy itself.
 	 */
@@ -257,7 +265,9 @@ void srv_set_stopped(struct server *s, const char *reason)
 	Warning("%s.\n", trash.str);
 
 	/* we don't send an alert if the server was previously paused */
-	send_log(s->proxy, srv_was_stopping ? LOG_NOTICE : LOG_ALERT, "%s.\n", trash.str);
+	log_level = srv_was_stopping ? LOG_NOTICE : LOG_ALERT;
+	send_log(s->proxy, log_level, "%s.\n", trash.str);
+	send_email_alert(s, log_level, "%s", trash.str);
 
 	if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
 		set_backend_down(s->proxy);
@@ -308,12 +318,12 @@ void srv_set_running(struct server *s, const char *reason)
 
 	/* If the server is set with "on-marked-up shutdown-backup-sessions",
 	 * and it's not a backup server and its effective weight is > 0,
-	 * then it can accept new connections, so we shut down all sessions
+	 * then it can accept new connections, so we shut down all streams
 	 * on all backup servers.
 	 */
 	if ((s->onmarkedup & HANA_ONMARKEDUP_SHUTDOWNBACKUPSESSIONS) &&
 	    !(s->flags & SRV_F_BACKUP) && s->eweight)
-		srv_shutdown_backup_sessions(s->proxy, SN_ERR_UP);
+		srv_shutdown_backup_streams(s->proxy, SF_ERR_UP);
 
 	/* check if we can handle some connections queued at the proxy. We
 	 * will take as many as we can handle.
@@ -327,6 +337,7 @@ void srv_set_running(struct server *s, const char *reason)
 	srv_append_status(&trash, s, reason, xferred, 0);
 	Warning("%s.\n", trash.str);
 	send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.str);
+	send_email_alert(s, LOG_NOTICE, "%s", trash.str);
 
 	for (srv = s->trackers; srv; srv = srv->tracknext)
 		srv_set_running(srv, NULL);
@@ -356,7 +367,7 @@ void srv_set_stopping(struct server *s, const char *reason)
 	if (s->proxy->lbprm.set_server_status_down)
 		s->proxy->lbprm.set_server_status_down(s);
 
-	/* we might have sessions queued on this server and waiting for
+	/* we might have streams queued on this server and waiting for
 	 * a connection. Those which are redispatchable will be queued
 	 * to another server or to the proxy itself.
 	 */
@@ -433,9 +444,9 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode)
 				s->proxy->lbprm.set_server_status_down(s);
 
 			if (s->onmarkeddown & HANA_ONMARKEDDOWN_SHUTDOWNSESSIONS)
-				srv_shutdown_sessions(s, SN_ERR_DOWN);
+				srv_shutdown_streams(s, SF_ERR_DOWN);
 
-			/* we might have sessions queued on this server and waiting for
+			/* we might have streams queued on this server and waiting for
 			 * a connection. Those which are redispatchable will be queued
 			 * to another server or to the proxy itself.
 			 */
@@ -466,7 +477,7 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode)
 		if (s->proxy->lbprm.set_server_status_down)
 			s->proxy->lbprm.set_server_status_down(s);
 
-		/* we might have sessions queued on this server and waiting for
+		/* we might have streams queued on this server and waiting for
 		 * a connection. Those which are redispatchable will be queued
 		 * to another server or to the proxy itself.
 		 */
@@ -479,6 +490,7 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode)
 
 		Warning("%s.\n", trash.str);
 		send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.str);
+		send_email_alert(s, LOG_NOTICE, "%s", trash.str);
 
 		if (prev_srv_count && s->proxy->srv_bck == 0 && s->proxy->srv_act == 0)
 			set_backend_down(s->proxy);
@@ -590,12 +602,12 @@ void srv_clr_admin_flag(struct server *s, enum srv_admin mode)
 
 			/* If the server is set with "on-marked-up shutdown-backup-sessions",
 			 * and it's not a backup server and its effective weight is > 0,
-			 * then it can accept new connections, so we shut down all sessions
+			 * then it can accept new connections, so we shut down all streams
 			 * on all backup servers.
 			 */
 			if ((s->onmarkedup & HANA_ONMARKEDUP_SHUTDOWNBACKUPSESSIONS) &&
 			    !(s->flags & SRV_F_BACKUP) && s->eweight)
-				srv_shutdown_backup_sessions(s->proxy, SN_ERR_UP);
+				srv_shutdown_backup_streams(s->proxy, SF_ERR_UP);
 
 			/* check if we can handle some connections queued at the proxy. We
 			 * will take as many as we can handle.
@@ -795,33 +807,27 @@ const char *server_parse_weight_change_request(struct server *sv,
 	return NULL;
 }
 
-static int init_check(struct check *check, int type, const char * file, int linenum)
+/*
+ * Parses <addr_str> and configures <sv> accordingly.
+ * Returns:
+ *  - error string on error
+ *  - NULL on success
+ */
+const char *server_parse_addr_change_request(struct server *sv,
+                                             const char *addr_str)
 {
-	check->type = type;
+	unsigned char ip[INET6_ADDRSTRLEN];
 
-	/* Allocate buffer for requests... */
-	if ((check->bi = calloc(sizeof(struct buffer) + global.tune.chksize, sizeof(char))) == NULL) {
-		Alert("parsing [%s:%d] : out of memory while allocating check buffer.\n", file, linenum);
-		return ERR_ALERT | ERR_ABORT;
+	if (inet_pton(AF_INET6, addr_str, ip)) {
+		update_server_addr(sv, ip, AF_INET6, "stats command");
+		return NULL;
 	}
-	check->bi->size = global.tune.chksize;
-
-	/* Allocate buffer for responses... */
-	if ((check->bo = calloc(sizeof(struct buffer) + global.tune.chksize, sizeof(char))) == NULL) {
-		Alert("parsing [%s:%d] : out of memory while allocating check buffer.\n", file, linenum);
-		return ERR_ALERT | ERR_ABORT;
-	}
-	check->bo->size = global.tune.chksize;
-
-	/* Allocate buffer for partial results... */
-	if ((check->conn = calloc(1, sizeof(struct connection))) == NULL) {
-		Alert("parsing [%s:%d] : out of memory while allocating check connection.\n", file, linenum);
-		return ERR_ALERT | ERR_ABORT;
+	if (inet_pton(AF_INET, addr_str, ip)) {
+		update_server_addr(sv, ip, AF_INET, "stats command");
+		return NULL;
 	}
 
-	check->conn->t.sock.fd = -1; /* no agent in progress yet */
-
-	return 0;
+	return "Could not understand IP address format.\n";
 }
 
 int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, struct proxy *defproxy)
@@ -831,6 +837,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 	char *errmsg = NULL;
 	int err_code = 0;
 	unsigned val;
+	char *fqdn = NULL;
 
 	if (!strcmp(args[0], "server") || !strcmp(args[0], "default-server")) {  /* server address */
 		int cur_arg;
@@ -864,6 +871,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			struct sockaddr_storage *sk;
 			int port1, port2;
 			struct protocol *proto;
+			struct dns_resolution *curr_resolution;
 
 			if ((newsrv = (struct server *)calloc(1, sizeof(struct server))) == NULL) {
 				Alert("parsing [%s:%d] : out of memory.\n", file, linenum);
@@ -881,6 +889,9 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			newsrv->obj_type = OBJ_TYPE_SERVER;
 			LIST_INIT(&newsrv->actconns);
 			LIST_INIT(&newsrv->pendconns);
+			LIST_INIT(&newsrv->priv_conns);
+			LIST_INIT(&newsrv->idle_conns);
+			LIST_INIT(&newsrv->safe_conns);
 			do_check = 0;
 			do_agent = 0;
 			newsrv->flags = 0;
@@ -896,7 +907,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			 *  - IP:+N => port=+N, relative
 			 *  - IP:-N => port=-N, relative
 			 */
-			sk = str2sa_range(args[2], &port1, &port2, &errmsg, NULL);
+			sk = str2sa_range(args[2], &port1, &port2, &errmsg, NULL, &fqdn, 1);
 			if (!sk) {
 				Alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
 				err_code |= ERR_ALERT | ERR_FATAL;
@@ -927,11 +938,39 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				realport = port1;
 			}
 
+			/* save hostname and create associated name resolution */
+			newsrv->hostname = fqdn;
+			if (!fqdn)
+				goto skip_name_resolution;
+
+			fqdn = NULL;
+			if ((curr_resolution = calloc(1, sizeof(struct dns_resolution))) == NULL)
+				goto skip_name_resolution;
+
+			curr_resolution->hostname_dn_len = dns_str_to_dn_label_len(newsrv->hostname);
+			if ((curr_resolution->hostname_dn = calloc(curr_resolution->hostname_dn_len + 1, sizeof(char))) == NULL)
+				goto skip_name_resolution;
+			if ((dns_str_to_dn_label(newsrv->hostname, curr_resolution->hostname_dn, curr_resolution->hostname_dn_len + 1)) == NULL) {
+				Alert("parsing [%s:%d] : Invalid hostname '%s'\n",
+				      file, linenum, args[2]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			curr_resolution->requester = newsrv;
+			curr_resolution->requester_cb = snr_resolution_cb;
+			curr_resolution->requester_error_cb = snr_resolution_error_cb;
+			curr_resolution->status = RSLV_STATUS_NONE;
+			curr_resolution->step = RSLV_STEP_NONE;
+			/* a first resolution has been done by the configuration parser */
+			curr_resolution->last_resolution = 0;
+			newsrv->resolution = curr_resolution;
+
+ skip_name_resolution:
 			newsrv->addr = *sk;
-			newsrv->proto = newsrv->check_common.proto = protocol_by_family(newsrv->addr.ss_family);
 			newsrv->xprt  = newsrv->check.xprt = newsrv->agent.xprt = &raw_sock;
 
-			if (!newsrv->proto) {
+			if (!protocol_by_family(newsrv->addr.ss_family)) {
 				Alert("parsing [%s:%d] : Unknown protocol family %d '%s'\n",
 				      file, linenum, newsrv->addr.ss_family, args[2]);
 				err_code |= ERR_ALERT | ERR_FATAL;
@@ -968,17 +1007,22 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			newsrv->check.fall	= curproxy->defsrv.check.fall;
 			newsrv->check.health	= newsrv->check.rise;	/* up, but will fall down at first failure */
 			newsrv->check.server	= newsrv;
+			newsrv->check.tcpcheck_rules	= &curproxy->tcpcheck_rules;
 
 			newsrv->agent.status	= HCHK_STATUS_INI;
 			newsrv->agent.rise	= curproxy->defsrv.agent.rise;
 			newsrv->agent.fall	= curproxy->defsrv.agent.fall;
 			newsrv->agent.health	= newsrv->agent.rise;	/* up, but will fall down at first failure */
 			newsrv->agent.server	= newsrv;
+			newsrv->resolver_family_priority = curproxy->defsrv.resolver_family_priority;
+			if (newsrv->resolver_family_priority == AF_UNSPEC)
+				newsrv->resolver_family_priority = AF_INET6;
 
 			cur_arg = 3;
 		} else {
 			newsrv = &curproxy->defsrv;
 			cur_arg = 1;
+			newsrv->resolver_family_priority = AF_INET6;
 		}
 
 		while (*args[cur_arg]) {
@@ -1016,6 +1060,23 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			else if (!defsrv && !strcmp(args[cur_arg], "redir")) {
 				newsrv->rdr_pfx = strdup(args[cur_arg + 1]);
 				newsrv->rdr_len = strlen(args[cur_arg + 1]);
+				cur_arg += 2;
+			}
+			else if (!strcmp(args[cur_arg], "resolvers")) {
+				newsrv->resolvers_id = strdup(args[cur_arg + 1]);
+				cur_arg += 2;
+			}
+			else if (!strcmp(args[cur_arg], "resolve-prefer")) {
+				if (!strcmp(args[cur_arg + 1], "ipv4"))
+					newsrv->resolver_family_priority = AF_INET;
+				else if (!strcmp(args[cur_arg + 1], "ipv6"))
+					newsrv->resolver_family_priority = AF_INET6;
+				else {
+					Alert("parsing [%s:%d]: '%s' expects either ipv4 or ipv6 as argument.\n",
+						file, linenum, args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
 				cur_arg += 2;
 			}
 			else if (!strcmp(args[cur_arg], "rise")) {
@@ -1113,7 +1174,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				int port1, port2;
 				struct protocol *proto;
 
-				sk = str2sa_range(args[cur_arg + 1], &port1, &port2, &errmsg, NULL);
+				sk = str2sa_range(args[cur_arg + 1], &port1, &port2, &errmsg, NULL, NULL, 1);
 				if (!sk) {
 					Alert("parsing [%s:%d] : '%s' : %s\n",
 					      file, linenum, args[cur_arg], errmsg);
@@ -1136,8 +1197,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 					goto out;
 				}
 
-				newsrv->check_common.addr = *sk;
-				newsrv->check_common.proto = protocol_by_family(sk->ss_family);
+				newsrv->check.addr = newsrv->agent.addr = *sk;
 				cur_arg += 2;
 			}
 			else if (!strcmp(args[cur_arg], "port")) {
@@ -1219,6 +1279,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				cur_arg += 1;
 			}
 			else if (!defsrv && !strcmp(args[cur_arg], "disabled")) {
+				newsrv->admin |= SRV_ADMF_CMAINT;
 				newsrv->admin |= SRV_ADMF_FMAINT;
 				newsrv->state = SRV_ST_STOPPED;
 				newsrv->check.state |= CHK_ST_PAUSED;
@@ -1322,7 +1383,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				}
 
 				newsrv->conn_src.opts |= CO_SRC_BIND;
-				sk = str2sa_range(args[cur_arg + 1], &port_low, &port_high, &errmsg, NULL);
+				sk = str2sa_range(args[cur_arg + 1], &port_low, &port_high, &errmsg, NULL, NULL, 1);
 				if (!sk) {
 					Alert("parsing [%s:%d] : '%s %s' : %s\n",
 					      file, linenum, args[cur_arg], args[cur_arg+1], errmsg);
@@ -1366,15 +1427,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				cur_arg += 2;
 				while (*(args[cur_arg])) {
 					if (!strcmp(args[cur_arg], "usesrc")) {  /* address to use outside */
-#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
-#if !defined(CONFIG_HAP_TRANSPARENT)
-						if (!is_inet_addr(&newsrv->conn_src.source_addr)) {
-							Alert("parsing [%s:%d] : '%s' requires an explicit '%s' address.\n",
-							      file, linenum, "usesrc", "source");
-							err_code |= ERR_ALERT | ERR_FATAL;
-							goto out;
-						}
-#endif
+#if defined(CONFIG_HAP_TRANSPARENT)
 						if (!*args[cur_arg + 1]) {
 							Alert("parsing [%s:%d] : '%s' expects <addr>[:<port>], 'client', 'clientip', or 'hdr_ip(name,#)' as argument.\n",
 							      file, linenum, "usesrc");
@@ -1430,7 +1483,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 							struct sockaddr_storage *sk;
 							int port1, port2;
 
-							sk = str2sa_range(args[cur_arg + 1], &port1, &port2, &errmsg, NULL);
+							sk = str2sa_range(args[cur_arg + 1], &port1, &port2, &errmsg, NULL, NULL, 1);
 							if (!sk) {
 								Alert("parsing [%s:%d] : '%s %s' : %s\n",
 								      file, linenum, args[cur_arg], args[cur_arg+1], errmsg);
@@ -1456,9 +1509,6 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 							newsrv->conn_src.opts |= CO_SRC_TPROXY_ADDR;
 						}
 						global.last_checks |= LSTCHK_NETADM;
-#if !defined(CONFIG_HAP_TRANSPARENT)
-						global.last_checks |= LSTCHK_CTTPROXY;
-#endif
 						cur_arg += 2;
 						continue;
 #else	/* no TPROXY support */
@@ -1466,7 +1516,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 						      file, linenum, "usesrc");
 						err_code |= ERR_ALERT | ERR_FATAL;
 						goto out;
-#endif /* defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT) */
+#endif /* defined(CONFIG_HAP_TRANSPARENT) */
 					} /* "usesrc" */
 
 					if (!strcmp(args[cur_arg], "interface")) { /* specifically bind to this interface */
@@ -1499,6 +1549,31 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				      file, linenum, "usesrc", "source");
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
+			}
+			else if (!defsrv && !strcmp(args[cur_arg], "namespace")) {
+#ifdef CONFIG_HAP_NS
+				char *arg = args[cur_arg + 1];
+				if (!strcmp(arg, "*")) {
+					newsrv->flags |= SRV_F_USE_NS_FROM_PP;
+				} else {
+					newsrv->netns = netns_store_lookup(arg, strlen(arg));
+
+					if (newsrv->netns == NULL)
+						newsrv->netns = netns_store_insert(arg);
+
+					if (newsrv->netns == NULL) {
+						Alert("Cannot open namespace '%s'.\n", args[cur_arg + 1]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+				}
+#else
+				Alert("parsing [%s:%d] : '%s' : '%s' option not implemented.\n",
+				      file, linenum, args[0], args[cur_arg]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+#endif
+				cur_arg += 2;
 			}
 			else {
 				static int srv_dumped;
@@ -1566,7 +1641,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 		}
 
 		if (do_check) {
-			int ret;
+			const char *ret;
 
 			if (newsrv->trackit) {
 				Alert("parsing [%s:%d]: unable to enable checks and tracking at the same time!\n",
@@ -1580,7 +1655,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			 * same as for the production traffic. Otherwise we use raw_sock by
 			 * default, unless one is specified.
 			 */
-			if (!newsrv->check.port && !is_addr(&newsrv->check_common.addr)) {
+			if (!newsrv->check.port && !is_addr(&newsrv->check.addr)) {
 #ifdef USE_OPENSSL
 				newsrv->check.use_ssl |= (newsrv->use_ssl || (newsrv->proxy->options & PR_O_TCPCHK_SSL));
 #endif
@@ -1588,7 +1663,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			}
 			/* try to get the port from check_core.addr if check.port not set */
 			if (!newsrv->check.port)
-				newsrv->check.port = get_host_port(&newsrv->check_common.addr);
+				newsrv->check.port = get_host_port(&newsrv->check.addr);
 
 			if (!newsrv->check.port)
 				newsrv->check.port = realport; /* by default */
@@ -1611,9 +1686,9 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			 * be a 'connect' one when checking an IPv4/IPv6 server.
 			 */
 			if (!newsrv->check.port &&
-			    (is_inet_addr(&newsrv->check_common.addr) ||
-			     (!is_addr(&newsrv->check_common.addr) && is_inet_addr(&newsrv->addr)))) {
-				struct tcpcheck_rule *n = NULL, *r = NULL;
+			    (is_inet_addr(&newsrv->check.addr) ||
+			     (!is_addr(&newsrv->check.addr) && is_inet_addr(&newsrv->addr)))) {
+				struct tcpcheck_rule *r = NULL;
 				struct list *l;
 
 				r = (struct tcpcheck_rule *)newsrv->proxy->tcpcheck_rules.n;
@@ -1622,6 +1697,12 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 					      file, linenum, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
+				}
+				/* search the first action (connect / send / expect) in the list */
+				l = &newsrv->proxy->tcpcheck_rules;
+				list_for_each_entry(r, l, list) {
+					if (r->action != TCPCHK_ACT_COMMENT)
+						break;
 				}
 				if ((r->action != TCPCHK_ACT_CONNECT) || !r->port) {
 					Alert("parsing [%s:%d] : server %s has neither service port nor check port nor tcp_check rule 'connect' with port information. Check has been disabled.\n",
@@ -1632,8 +1713,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				else {
 					/* scan the tcp-check ruleset to ensure a port has been configured */
 					l = &newsrv->proxy->tcpcheck_rules;
-					list_for_each_entry(n, l, list) {
-						r = (struct tcpcheck_rule *)n->list.p;
+					list_for_each_entry(r, l, list) {
 						if ((r->action == TCPCHK_ACT_CONNECT) && (!r->port)) {
 							Alert("parsing [%s:%d] : server %s has neither service port nor check port, and a tcp_check rule 'connect' with no port information. Check has been disabled.\n",
 							      file, linenum, newsrv->id);
@@ -1645,17 +1725,21 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			}
 
 			/* note: check type will be set during the config review phase */
-			ret = init_check(&newsrv->check, 0, file, linenum);
+			ret = init_check(&newsrv->check, 0);
 			if (ret) {
-				err_code |= ret;
+				Alert("parsing [%s:%d] : %s.\n", file, linenum, ret);
+				err_code |= ERR_ALERT | ERR_ABORT;
 				goto out;
 			}
+
+			if (newsrv->resolution)
+				newsrv->resolution->resolver_family_priority = newsrv->resolver_family_priority;
 
 			newsrv->check.state |= CHK_ST_CONFIGURED | CHK_ST_ENABLED;
 		}
 
 		if (do_agent) {
-			int ret;
+			const char *ret;
 
 			if (!newsrv->agent.port) {
 				Alert("parsing [%s:%d] : server %s does not have agent port. Agent check has been disabled.\n",
@@ -1667,9 +1751,10 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			if (!newsrv->agent.inter)
 				newsrv->agent.inter = newsrv->check.inter;
 
-			ret = init_check(&newsrv->agent, PR_O2_LB_AGENT_CHK, file, linenum);
+			ret = init_check(&newsrv->agent, PR_O2_LB_AGENT_CHK);
 			if (ret) {
-				err_code |= ret;
+				Alert("parsing [%s:%d] : %s.\n", file, linenum, ret);
+				err_code |= ERR_ALERT | ERR_ABORT;
 				goto out;
 			}
 
@@ -1685,11 +1770,1044 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			srv_lb_commit_status(newsrv);
 		}
 	}
+	free(fqdn);
 	return 0;
 
  out:
+	free(fqdn);
 	free(errmsg);
 	return err_code;
+}
+
+/* Returns a pointer to the first server matching either id <id>.
+ * NULL is returned if no match is found.
+ * the lookup is performed in the backend <bk>
+ */
+struct server *server_find_by_id(struct proxy *bk, int id)
+{
+	struct eb32_node *eb32;
+	struct server *curserver;
+
+	if (!bk || (id ==0))
+		return NULL;
+
+	/* <bk> has no backend capabilities, so it can't have a server */
+	if (!(bk->cap & PR_CAP_BE))
+		return NULL;
+
+	curserver = NULL;
+
+	eb32 = eb32_lookup(&bk->conf.used_server_id, id);
+	if (eb32)
+		curserver = container_of(eb32, struct server, conf.id);
+
+	return curserver;
+}
+
+/* Returns a pointer to the first server matching either name <name>, or id
+ * if <name> starts with a '#'. NULL is returned if no match is found.
+ * the lookup is performed in the backend <bk>
+ */
+struct server *server_find_by_name(struct proxy *bk, const char *name)
+{
+	struct server *curserver;
+
+	if (!bk || !name)
+		return NULL;
+
+	/* <bk> has no backend capabilities, so it can't have a server */
+	if (!(bk->cap & PR_CAP_BE))
+		return NULL;
+
+	curserver = NULL;
+	if (*name == '#') {
+		curserver = server_find_by_id(bk, atoi(name + 1));
+		if (curserver)
+			return curserver;
+	}
+	else {
+		curserver = bk->srv;
+
+		while (curserver && (strcmp(curserver->id, name) != 0))
+			curserver = curserver->next;
+
+		if (curserver)
+			return curserver;
+	}
+
+	return NULL;
+}
+
+struct server *server_find_best_match(struct proxy *bk, char *name, int id, int *diff)
+{
+	struct server *byname;
+	struct server *byid;
+
+	if (!name && !id)
+		return NULL;
+
+	if (diff)
+		*diff = 0;
+
+	byname = byid = NULL;
+
+	if (name) {
+		byname = server_find_by_name(bk, name);
+		if (byname && (!id || byname->puid == id))
+			return byname;
+	}
+
+	/* remaining possibilities :
+	 *  - name not set
+	 *  - name set but not found
+	 *  - name found but ID doesn't match
+	 */
+	if (id) {
+		byid = server_find_by_id(bk, id);
+		if (byid) {
+			if (byname) {
+				/* use id only if forced by configuration */
+				if (byid->flags & SRV_F_FORCED_ID) {
+					if (diff)
+						*diff |= 2;
+					return byid;
+				}
+				else {
+					if (diff)
+						*diff |= 1;
+					return byname;
+				}
+			}
+
+			/* remaining possibilities:
+			 *   - name not set
+			 *   - name set but not found
+			 */
+			if (name && diff)
+				*diff |= 2;
+			return byid;
+		}
+
+		/* id bot found */
+		if (byname) {
+			if (diff)
+				*diff |= 1;
+			return byname;
+		}
+	}
+
+	return NULL;
+}
+
+/* Update a server state using the parameters available in the params list */
+static void srv_update_state(struct server *srv, int version, char **params)
+{
+	char *p;
+	struct chunk *msg;
+
+	/* fields since version 1
+	 * and common to all other upcoming versions
+	 */
+	enum srv_state srv_op_state;
+	enum srv_admin srv_admin_state;
+	unsigned srv_uweight, srv_iweight;
+	unsigned long srv_last_time_change;
+	short srv_check_status;
+	enum chk_result srv_check_result;
+	int srv_check_health;
+	int srv_check_state, srv_agent_state;
+	int bk_f_forced_id;
+	int srv_f_forced_id;
+
+	msg = get_trash_chunk();
+	switch (version) {
+		case 1:
+			/*
+			 * now we can proceed with server's state update:
+			 * srv_addr:             params[0]
+			 * srv_op_state:         params[1]
+			 * srv_admin_state:      params[2]
+			 * srv_uweight:          params[3]
+			 * srv_iweight:          params[4]
+			 * srv_last_time_change: params[5]
+			 * srv_check_status:     params[6]
+			 * srv_check_result:     params[7]
+			 * srv_check_health:     params[8]
+			 * srv_check_state:      params[9]
+			 * srv_agent_state:      params[10]
+			 * bk_f_forced_id:       params[11]
+			 * srv_f_forced_id:      params[12]
+			 */
+
+			/* validating srv_op_state */
+			p = NULL;
+			errno = 0;
+			srv_op_state = strtol(params[1], &p, 10);
+			if ((p == params[1]) || errno == EINVAL || errno == ERANGE ||
+			    (srv_op_state != SRV_ST_STOPPED &&
+			     srv_op_state != SRV_ST_STARTING &&
+			     srv_op_state != SRV_ST_RUNNING &&
+			     srv_op_state != SRV_ST_STOPPING)) {
+				chunk_appendf(msg, ", invalid srv_op_state value '%s'", params[1]);
+			}
+
+			/* validating srv_admin_state */
+			p = NULL;
+			errno = 0;
+			srv_admin_state = strtol(params[2], &p, 10);
+			if ((p == params[2]) || errno == EINVAL || errno == ERANGE ||
+			    (srv_admin_state != 0 &&
+			     srv_admin_state != SRV_ADMF_FMAINT &&
+			     srv_admin_state != SRV_ADMF_IMAINT &&
+			     srv_admin_state != SRV_ADMF_CMAINT &&
+			     srv_admin_state != (SRV_ADMF_CMAINT | SRV_ADMF_FMAINT) &&
+			     srv_admin_state != SRV_ADMF_FDRAIN &&
+			     srv_admin_state != SRV_ADMF_IDRAIN)) {
+				chunk_appendf(msg, ", invalid srv_admin_state value '%s'", params[2]);
+			}
+
+			/* validating srv_uweight */
+			p = NULL;
+			errno = 0;
+			srv_uweight = strtol(params[3], &p, 10);
+			if ((p == params[3]) || errno == EINVAL || errno == ERANGE || (srv_uweight > SRV_UWGHT_MAX))
+				chunk_appendf(msg, ", invalid srv_uweight value '%s'", params[3]);
+
+			/* validating srv_iweight */
+			p = NULL;
+			errno = 0;
+			srv_iweight = strtol(params[4], &p, 10);
+			if ((p == params[4]) || errno == EINVAL || errno == ERANGE || (srv_iweight > SRV_UWGHT_MAX))
+				chunk_appendf(msg, ", invalid srv_iweight value '%s'", params[4]);
+
+			/* validating srv_last_time_change */
+			p = NULL;
+			errno = 0;
+			srv_last_time_change = strtol(params[5], &p, 10);
+			if ((p == params[5]) || errno == EINVAL || errno == ERANGE)
+				chunk_appendf(msg, ", invalid srv_last_time_change value '%s'", params[5]);
+
+			/* validating srv_check_status */
+			p = NULL;
+			errno = 0;
+			srv_check_status = strtol(params[6], &p, 10);
+			if (p == params[6] || errno == EINVAL || errno == ERANGE ||
+			    (srv_check_status >= HCHK_STATUS_SIZE))
+				chunk_appendf(msg, ", invalid srv_check_status value '%s'", params[6]);
+
+			/* validating srv_check_result */
+			p = NULL;
+			errno = 0;
+			srv_check_result = strtol(params[7], &p, 10);
+			if ((p == params[7]) || errno == EINVAL || errno == ERANGE ||
+			    (srv_check_result != CHK_RES_UNKNOWN &&
+			     srv_check_result != CHK_RES_NEUTRAL &&
+			     srv_check_result != CHK_RES_FAILED &&
+			     srv_check_result != CHK_RES_PASSED &&
+			     srv_check_result != CHK_RES_CONDPASS)) {
+				chunk_appendf(msg, ", invalid srv_check_result value '%s'", params[7]);
+			}
+
+			/* validating srv_check_health */
+			p = NULL;
+			errno = 0;
+			srv_check_health = strtol(params[8], &p, 10);
+			if (p == params[8] || errno == EINVAL || errno == ERANGE)
+				chunk_appendf(msg, ", invalid srv_check_health value '%s'", params[8]);
+
+			/* validating srv_check_state */
+			p = NULL;
+			errno = 0;
+			srv_check_state = strtol(params[9], &p, 10);
+			if (p == params[9] || errno == EINVAL || errno == ERANGE ||
+			    (srv_check_state & ~(CHK_ST_INPROGRESS | CHK_ST_CONFIGURED | CHK_ST_ENABLED | CHK_ST_PAUSED | CHK_ST_AGENT)))
+				chunk_appendf(msg, ", invalid srv_check_state value '%s'", params[9]);
+
+			/* validating srv_agent_state */
+			p = NULL;
+			errno = 0;
+			srv_agent_state = strtol(params[10], &p, 10);
+			if (p == params[10] || errno == EINVAL || errno == ERANGE ||
+			    (srv_agent_state & ~(CHK_ST_INPROGRESS | CHK_ST_CONFIGURED | CHK_ST_ENABLED | CHK_ST_PAUSED | CHK_ST_AGENT)))
+				chunk_appendf(msg, ", invalid srv_agent_state value '%s'", params[10]);
+
+			/* validating bk_f_forced_id */
+			p = NULL;
+			errno = 0;
+			bk_f_forced_id = strtol(params[11], &p, 10);
+			if (p == params[11] || errno == EINVAL || errno == ERANGE || !((bk_f_forced_id == 0) || (bk_f_forced_id == 1)))
+				chunk_appendf(msg, ", invalid bk_f_forced_id value '%s'", params[11]);
+
+			/* validating srv_f_forced_id */
+			p = NULL;
+			errno = 0;
+			srv_f_forced_id = strtol(params[12], &p, 10);
+			if (p == params[12] || errno == EINVAL || errno == ERANGE || !((srv_f_forced_id == 0) || (srv_f_forced_id == 1)))
+				chunk_appendf(msg, ", invalid srv_f_forced_id value '%s'", params[12]);
+
+
+			/* don't apply anything if one error has been detected */
+			if (msg->len)
+				goto out;
+
+			/* recover operational state and apply it to this server
+			 * and all servers tracking this one */
+			switch (srv_op_state) {
+				case SRV_ST_STOPPED:
+					srv->check.health = 0;
+					srv_set_stopped(srv, "changed from server-state after a reload");
+					break;
+				case SRV_ST_STARTING:
+					srv->state = srv_op_state;
+					break;
+				case SRV_ST_STOPPING:
+					srv->check.health = srv->check.rise + srv->check.fall - 1;
+					srv_set_stopping(srv, "changed from server-state after a reload");
+					break;
+				case SRV_ST_RUNNING:
+					srv->check.health = srv->check.rise + srv->check.fall - 1;
+					srv_set_running(srv, "");
+					break;
+			}
+
+			/* When applying server state, the following rules apply:
+			 * - in case of a configuration change, we apply the setting from the new
+			 *   configuration, regardless of old running state
+			 * - if no configuration change, we apply old running state only if old running
+			 *   state is different from new configuration state
+			 */
+			/* configuration has changed */
+			if ((srv_admin_state & SRV_ADMF_CMAINT) != (srv->admin & SRV_ADMF_CMAINT)) {
+				if (srv->admin & SRV_ADMF_CMAINT)
+					srv_adm_set_maint(srv);
+				else
+					srv_adm_set_ready(srv);
+			}
+			/* configuration is the same, let's compate old running state and new conf state */
+			else {
+				if (srv_admin_state & SRV_ADMF_FMAINT && !(srv->admin & SRV_ADMF_CMAINT))
+					srv_adm_set_maint(srv);
+				else if (!(srv_admin_state & SRV_ADMF_FMAINT) && (srv->admin & SRV_ADMF_CMAINT))
+					srv_adm_set_ready(srv);
+			}
+			/* apply drain mode if server is currently enabled */
+			if (!(srv->admin & SRV_ADMF_FMAINT) && (srv_admin_state & SRV_ADMF_FDRAIN)) {
+				/* The SRV_ADMF_FDRAIN flag is inherited when srv->iweight is 0
+				 * (srv->iweight is the weight set up in configuration)
+				 * so we don't want to apply it when srv_iweight is 0 and
+				 * srv->iweight is greater than 0. Purpose is to give the
+				 * chance to the admin to re-enable this server from configuration
+				 * file by setting a new weight > 0.
+				 */
+				if ((srv_iweight == 0) && (srv->iweight > 0)) {
+					srv_adm_set_drain(srv);
+				}
+			}
+
+			srv->last_change = date.tv_sec - srv_last_time_change;
+			srv->check.status = srv_check_status;
+			srv->check.result = srv_check_result;
+			srv->check.health = srv_check_health;
+
+			/* Only case we want to apply is removing ENABLED flag which could have been
+			 * done by the "disable health" command over the stats socket
+			 */
+			if ((srv->check.state & CHK_ST_CONFIGURED) &&
+			    (srv_check_state & CHK_ST_CONFIGURED) &&
+			    !(srv_check_state & CHK_ST_ENABLED))
+				srv->check.state &= ~CHK_ST_ENABLED;
+
+			/* Only case we want to apply is removing ENABLED flag which could have been
+			 * done by the "disable agent" command over the stats socket
+			 */
+			if ((srv->agent.state & CHK_ST_CONFIGURED) &&
+			    (srv_agent_state & CHK_ST_CONFIGURED) &&
+			    !(srv_agent_state & CHK_ST_ENABLED))
+				srv->agent.state &= ~CHK_ST_ENABLED;
+
+			/* We want to apply the previous 'running' weight (srv_uweight) only if there
+			 * was no change in the configuration: both previous and new iweight are equals
+			 *
+			 * It means that a configuration file change has precedence over a unix socket change
+			 * for server's weight
+			 *
+			 * by default, HAProxy applies the following weight when parsing the configuration
+			 *    srv->uweight = srv->iweight
+			 */
+			if (srv_iweight == srv->iweight) {
+				srv->uweight = srv_uweight;
+			}
+			server_recalc_eweight(srv);
+
+			/* update server IP only if DNS resolution is used on the server */
+			if (srv->resolution) {
+				struct sockaddr_storage addr;
+
+				memset(&addr, 0, sizeof(struct sockaddr_storage));
+
+				if (str2ip2(params[0], &addr, AF_UNSPEC)) {
+					int port;
+
+					/* save the port, applies the new IP then reconfigure the port */
+					port = get_host_port(&srv->addr);
+					srv->addr.ss_family = addr.ss_family;
+					str2ip2(params[0], &srv->addr, srv->addr.ss_family);
+					set_host_port(&srv->addr, port);
+				}
+				else
+					chunk_appendf(msg, ", can't parse IP: %s", params[0]);
+			}
+			break;
+		default:
+			chunk_appendf(msg, ", version '%d' not supported", version);
+	}
+
+ out:
+	if (msg->len) {
+		chunk_appendf(msg, "\n");
+		Warning("server-state application failed for server '%s/%s'%s",
+		        srv->proxy->id, srv->id, msg->str);
+	}
+}
+
+/* This function parses all the proxies and only take care of the backends (since we're looking for server)
+ * For each proxy, it does the following:
+ *  - opens its server state file (either one or local one)
+ *  - read whole file, line by line
+ *  - analyse each line to check if it matches our current backend:
+ *    - backend name matches
+ *    - backend id matches if id is forced and name doesn't match
+ *  - if the server pointed by the line is found, then state is applied
+ *
+ * If the running backend uuid or id differs from the state file, then HAProxy reports
+ * a warning.
+ */
+void apply_server_state(void)
+{
+	char *cur, *end;
+	char mybuf[SRV_STATE_LINE_MAXLEN];
+	int mybuflen;
+	char *params[SRV_STATE_FILE_MAX_FIELDS];
+	char *srv_params[SRV_STATE_FILE_MAX_FIELDS];
+	int arg, srv_arg, version, diff;
+	FILE *f;
+	char *filepath;
+	char globalfilepath[MAXPATHLEN + 1];
+	char localfilepath[MAXPATHLEN + 1];
+	int len, fileopenerr, globalfilepathlen, localfilepathlen;
+	extern struct proxy *proxy;
+	struct proxy *curproxy, *bk;
+	struct server *srv;
+
+	globalfilepathlen = 0;
+	/* create the globalfilepath variable */
+	if (global.server_state_file) {
+		/* absolute path or no base directory provided */
+	        if ((global.server_state_file[0] == '/') || (!global.server_state_base)) {
+			len = strlen(global.server_state_file);
+			if (len > MAXPATHLEN) {
+				globalfilepathlen = 0;
+				goto globalfileerror;
+			}
+			memcpy(globalfilepath, global.server_state_file, len);
+			globalfilepath[len] = '\0';
+			globalfilepathlen = len;
+		}
+		else if (global.server_state_base) {
+			len = strlen(global.server_state_base);
+			globalfilepathlen += len;
+
+			if (globalfilepathlen > MAXPATHLEN) {
+				globalfilepathlen = 0;
+				goto globalfileerror;
+			}
+			strncpy(globalfilepath, global.server_state_base, len);
+			globalfilepath[globalfilepathlen] = 0;
+
+			/* append a slash if needed */
+			if (!globalfilepathlen || globalfilepath[globalfilepathlen - 1] != '/') {
+				if (globalfilepathlen + 1 > MAXPATHLEN) {
+					globalfilepathlen = 0;
+					goto globalfileerror;
+				}
+				globalfilepath[globalfilepathlen++] = '/';
+			}
+
+			len = strlen(global.server_state_file);
+			if (globalfilepathlen + len > MAXPATHLEN) {
+				globalfilepathlen = 0;
+				goto globalfileerror;
+			}
+			memcpy(globalfilepath + globalfilepathlen, global.server_state_file, len);
+			globalfilepathlen += len;
+			globalfilepath[globalfilepathlen++] = 0;
+		}
+	}
+ globalfileerror:
+	if (globalfilepathlen == 0)
+		globalfilepath[0] = '\0';
+
+	/* read servers state from local file */
+	for (curproxy = proxy; curproxy != NULL; curproxy = curproxy->next) {
+		/* servers are only in backends */
+		if (!(curproxy->cap & PR_CAP_BE))
+			continue;
+		fileopenerr = 0;
+		filepath = NULL;
+
+		/* search server state file path and name */
+		switch (curproxy->load_server_state_from_file) {
+			/* read servers state from global file */
+			case PR_SRV_STATE_FILE_GLOBAL:
+				/* there was an error while generating global server state file path */
+				if (globalfilepathlen == 0)
+					continue;
+				filepath = globalfilepath;
+				fileopenerr = 1;
+				break;
+			/* this backend has its own file */
+			case PR_SRV_STATE_FILE_LOCAL:
+				localfilepathlen = 0;
+				localfilepath[0] = '\0';
+				len = 0;
+				/* create the localfilepath variable */
+				/* absolute path or no base directory provided */
+				if ((curproxy->server_state_file_name[0] == '/') || (!global.server_state_base)) {
+					len = strlen(curproxy->server_state_file_name);
+					if (len > MAXPATHLEN) {
+						localfilepathlen = 0;
+						goto localfileerror;
+					}
+					memcpy(localfilepath, curproxy->server_state_file_name, len);
+					localfilepath[len] = '\0';
+					localfilepathlen = len;
+				}
+				else if (global.server_state_base) {
+					len = strlen(global.server_state_base);
+					localfilepathlen += len;
+
+					if (localfilepathlen > MAXPATHLEN) {
+						localfilepathlen = 0;
+						goto localfileerror;
+					}
+					strncpy(localfilepath, global.server_state_base, len);
+					localfilepath[localfilepathlen] = 0;
+
+					/* append a slash if needed */
+					if (!localfilepathlen || localfilepath[localfilepathlen - 1] != '/') {
+						if (localfilepathlen + 1 > MAXPATHLEN) {
+							localfilepathlen = 0;
+							goto localfileerror;
+						}
+						localfilepath[localfilepathlen++] = '/';
+					}
+
+					len = strlen(curproxy->server_state_file_name);
+					if (localfilepathlen + len > MAXPATHLEN) {
+						localfilepathlen = 0;
+						goto localfileerror;
+					}
+					memcpy(localfilepath + localfilepathlen, curproxy->server_state_file_name, len);
+					localfilepathlen += len;
+					localfilepath[localfilepathlen++] = 0;
+				}
+				filepath = localfilepath;
+ localfileerror:
+				if (localfilepathlen == 0)
+					localfilepath[0] = '\0';
+
+				break;
+			case PR_SRV_STATE_FILE_NONE:
+			default:
+				continue;
+		}
+
+		/* preload global state file */
+		errno = 0;
+		f = fopen(filepath, "r");
+		if (errno && fileopenerr)
+			Warning("Can't open server state file '%s': %s\n", filepath, strerror(errno));
+		if (!f)
+			continue;
+
+		mybuf[0] = '\0';
+		mybuflen = 0;
+		version = 0;
+
+		/* first character of first line of the file must contain the version of the export */
+		if (fgets(mybuf, SRV_STATE_LINE_MAXLEN, f) == NULL) {
+			Warning("Can't read first line of the server state file '%s'\n", filepath);
+			goto fileclose;
+		}
+
+		cur = mybuf;
+		version = atoi(cur);
+		if ((version < SRV_STATE_FILE_VERSION_MIN) ||
+		    (version > SRV_STATE_FILE_VERSION_MAX))
+			goto fileclose;
+
+		while (fgets(mybuf, SRV_STATE_LINE_MAXLEN, f)) {
+			int bk_f_forced_id = 0;
+			int check_id = 0;
+			int check_name = 0;
+
+			mybuflen = strlen(mybuf);
+			cur = mybuf;
+			end = cur + mybuflen;
+
+			bk = NULL;
+			srv = NULL;
+
+			/* we need at least one character */
+			if (mybuflen == 0)
+				continue;
+
+			/* ignore blank characters at the beginning of the line */
+			while (isspace(*cur))
+				++cur;
+
+			if (cur == end)
+				continue;
+
+			/* ignore comment line */
+			if (*cur == '#')
+				continue;
+
+			/* we're now ready to move the line into *srv_params[] */
+			params[0] = cur;
+			arg = 1;
+			srv_arg = 0;
+			while (*cur && arg < SRV_STATE_FILE_MAX_FIELDS) {
+				if (isspace(*cur)) {
+					*cur = '\0';
+					++cur;
+					while (isspace(*cur))
+						++cur;
+					switch (version) {
+						case 1:
+							/*
+							 * srv_addr:             params[4]  => srv_params[0]
+							 * srv_op_state:         params[5]  => srv_params[1]
+							 * srv_admin_state:      params[6]  => srv_params[2]
+							 * srv_uweight:          params[7]  => srv_params[3]
+							 * srv_iweight:          params[8]  => srv_params[4]
+							 * srv_last_time_change: params[9]  => srv_params[5]
+							 * srv_check_status:     params[10] => srv_params[6]
+							 * srv_check_result:     params[11] => srv_params[7]
+							 * srv_check_health:     params[12] => srv_params[8]
+							 * srv_check_state:      params[13] => srv_params[9]
+							 * srv_agent_state:      params[14] => srv_params[10]
+							 * bk_f_forced_id:       params[15] => srv_params[11]
+							 * srv_f_forced_id:      params[16] => srv_params[12]
+							 */
+							if (arg >= 4) {
+								srv_params[srv_arg] = cur;
+								++srv_arg;
+							}
+							break;
+					}
+
+					params[arg] = cur;
+					++arg;
+				}
+				else {
+					++cur;
+				}
+			}
+
+			/* if line is incomplete line, then ignore it.
+			 * otherwise, update useful flags */
+			switch (version) {
+				case 1:
+					if (arg < SRV_STATE_FILE_NB_FIELDS_VERSION_1)
+						continue;
+					bk_f_forced_id = (atoi(params[15]) & PR_O_FORCED_ID);
+					check_id = (atoi(params[0]) == curproxy->uuid);
+					check_name = (strcmp(curproxy->id, params[1]) == 0);
+					break;
+			}
+
+			diff = 0;
+			bk = curproxy;
+
+			/* if backend can't be found, let's continue */
+			if (!check_id && !check_name)
+				continue;
+			else if (!check_id && check_name) {
+				Warning("backend ID mismatch: from server state file: '%s', from running config '%d'\n", params[0], bk->uuid);
+				send_log(bk, LOG_NOTICE, "backend ID mismatch: from server state file: '%s', from running config '%d'\n", params[0], bk->uuid);
+			}
+			else if (check_id && !check_name) {
+				Warning("backend name mismatch: from server state file: '%s', from running config '%s'\n", params[1], bk->id);
+				send_log(bk, LOG_NOTICE, "backend name mismatch: from server state file: '%s', from running config '%s'\n", params[1], bk->id);
+				/* if name doesn't match, we still want to update curproxy if the backend id
+				 * was forced in previous the previous configuration */
+				if (!bk_f_forced_id)
+					continue;
+			}
+
+			/* look for the server by its id: param[2] */
+			/* else look for the server by its name: param[3] */
+			diff = 0;
+			srv = server_find_best_match(bk, params[3], atoi(params[2]), &diff);
+
+			if (!srv) {
+				/* if no server found, then warning and continue with next line */
+				Warning("can't find server '%s' with id '%s' in backend with id '%s' or name '%s'\n",
+					params[3], params[2], params[0], params[1]);
+				send_log(bk, LOG_NOTICE, "can't find server '%s' with id '%s' in backend with id '%s' or name '%s'\n",
+					 params[3], params[2], params[0], params[1]);
+				continue;
+			}
+			else if (diff & PR_FBM_MISMATCH_ID) {
+				Warning("In backend '%s' (id: '%d'): server ID mismatch: from server state file: '%s', from running config %d\n", bk->id, bk->uuid, params[2], srv->puid);
+				send_log(bk, LOG_NOTICE, "In backend '%s' (id: %d): server ID mismatch: from server state file: '%s', from running config %d\n", bk->id, bk->uuid, params[2], srv->puid);
+			}
+			else if (diff & PR_FBM_MISMATCH_NAME) {
+				Warning("In backend '%s' (id: %d): server name mismatch: from server state file: '%s', from running config '%s'\n", bk->id, bk->uuid, params[3], srv->id);
+				send_log(bk, LOG_NOTICE, "In backend '%s' (id: %d): server name mismatch: from server state file: '%s', from running config '%s'\n", bk->id, bk->uuid, params[3], srv->id);
+			}
+
+			/* now we can proceed with server's state update */
+			srv_update_state(srv, version, srv_params);
+		}
+fileclose:
+		fclose(f);
+	}
+}
+
+/*
+ * update a server's current IP address.
+ * ip is a pointer to the new IP address, whose address family is ip_sin_family.
+ * ip is in network format.
+ * updater is a string which contains an information about the requester of the update.
+ * updater is used if not NULL.
+ *
+ * A log line and a stderr warning message is generated based on server's backend options.
+ */
+int update_server_addr(struct server *s, void *ip, int ip_sin_family, char *updater)
+{
+	/* generates a log line and a warning on stderr */
+	if (1) {
+		/* book enough space for both IPv4 and IPv6 */
+		char oldip[INET6_ADDRSTRLEN];
+		char newip[INET6_ADDRSTRLEN];
+
+		memset(oldip, '\0', INET6_ADDRSTRLEN);
+		memset(newip, '\0', INET6_ADDRSTRLEN);
+
+		/* copy old IP address in a string */
+		switch (s->addr.ss_family) {
+		case AF_INET:
+			inet_ntop(s->addr.ss_family, &((struct sockaddr_in *)&s->addr)->sin_addr, oldip, INET_ADDRSTRLEN);
+			break;
+		case AF_INET6:
+			inet_ntop(s->addr.ss_family, &((struct sockaddr_in6 *)&s->addr)->sin6_addr, oldip, INET6_ADDRSTRLEN);
+			break;
+		};
+
+		/* copy new IP address in a string */
+		switch (ip_sin_family) {
+		case AF_INET:
+			inet_ntop(ip_sin_family, ip, newip, INET_ADDRSTRLEN);
+			break;
+		case AF_INET6:
+			inet_ntop(ip_sin_family, ip, newip, INET6_ADDRSTRLEN);
+			break;
+		};
+
+		/* save log line into a buffer */
+		chunk_printf(&trash, "%s/%s changed its IP from %s to %s by %s",
+				s->proxy->id, s->id, oldip, newip, updater);
+
+		/* write the buffer on stderr */
+		Warning("%s.\n", trash.str);
+
+		/* send a log */
+		send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.str);
+	}
+
+	/* save the new IP family */
+	s->addr.ss_family = ip_sin_family;
+	/* save the new IP address */
+	switch (ip_sin_family) {
+	case AF_INET:
+		memcpy(&((struct sockaddr_in *)&s->addr)->sin_addr.s_addr, ip, 4);
+		break;
+	case AF_INET6:
+		memcpy(((struct sockaddr_in6 *)&s->addr)->sin6_addr.s6_addr, ip, 16);
+		break;
+	};
+
+	return 0;
+}
+
+/*
+ * update server status based on result of name resolution
+ * returns:
+ *  0 if server status is updated
+ *  1 if server status has not changed
+ */
+int snr_update_srv_status(struct server *s)
+{
+	struct dns_resolution *resolution = s->resolution;
+
+	switch (resolution->status) {
+		case RSLV_STATUS_NONE:
+			/* status when HAProxy has just (re)started */
+			trigger_resolution(s);
+			break;
+
+		default:
+			break;
+	}
+
+	return 1;
+}
+
+/*
+ * Server Name Resolution valid response callback
+ * It expects:
+ *  - <nameserver>: the name server which answered the valid response
+ *  - <response>: buffer containing a valid DNS response
+ *  - <response_len>: size of <response>
+ * It performs the following actions:
+ *  - ignore response if current ip found and server family not met
+ *  - update with first new ip found if family is met and current IP is not found
+ * returns:
+ *  0 on error
+ *  1 when no error or safe ignore
+ */
+int snr_resolution_cb(struct dns_resolution *resolution, struct dns_nameserver *nameserver, unsigned char *response, int response_len)
+{
+	struct server *s;
+	void *serverip, *firstip;
+	short server_sin_family, firstip_sin_family;
+	unsigned char *response_end;
+	int ret;
+	struct chunk *chk = get_trash_chunk();
+
+	/* initializing variables */
+	response_end = response + response_len;	/* pointer to mark the end of the response */
+	firstip = NULL;		/* pointer to the first valid response found */
+				/* it will be used as the new IP if a change is required */
+	firstip_sin_family = AF_UNSPEC;
+	serverip = NULL;	/* current server IP address */
+
+	/* shortcut to the server whose name is being resolved */
+	s = (struct server *)resolution->requester;
+
+	/* initializing server IP pointer */
+	server_sin_family = s->addr.ss_family;
+	switch (server_sin_family) {
+		case AF_INET:
+			serverip = &((struct sockaddr_in *)&s->addr)->sin_addr.s_addr;
+			break;
+
+		case AF_INET6:
+			serverip = &((struct sockaddr_in6 *)&s->addr)->sin6_addr.s6_addr;
+			break;
+
+		default:
+			goto invalid;
+	}
+
+	ret = dns_get_ip_from_response(response, response_end, resolution->hostname_dn, resolution->hostname_dn_len,
+			serverip, server_sin_family, resolution->resolver_family_priority, &firstip,
+			&firstip_sin_family);
+
+	switch (ret) {
+		case DNS_UPD_NO:
+			if (resolution->status != RSLV_STATUS_VALID) {
+				resolution->status = RSLV_STATUS_VALID;
+				resolution->last_status_change = now_ms;
+			}
+			goto stop_resolution;
+
+		case DNS_UPD_SRVIP_NOT_FOUND:
+			goto save_ip;
+
+		case DNS_UPD_CNAME:
+			if (resolution->status != RSLV_STATUS_VALID) {
+				resolution->status = RSLV_STATUS_VALID;
+				resolution->last_status_change = now_ms;
+			}
+			goto invalid;
+
+		case DNS_UPD_NO_IP_FOUND:
+			if (resolution->status != RSLV_STATUS_OTHER) {
+				resolution->status = RSLV_STATUS_OTHER;
+				resolution->last_status_change = now_ms;
+			}
+			goto stop_resolution;
+
+		case DNS_UPD_NAME_ERROR:
+			/* if this is not the last expected response, we ignore it */
+			if (resolution->nb_responses < nameserver->resolvers->count_nameservers)
+				return 0;
+			/* update resolution status to OTHER error type */
+			if (resolution->status != RSLV_STATUS_OTHER) {
+				resolution->status = RSLV_STATUS_OTHER;
+				resolution->last_status_change = now_ms;
+			}
+			goto stop_resolution;
+
+		default:
+			goto invalid;
+
+	}
+
+ save_ip:
+	nameserver->counters.update += 1;
+	if (resolution->status != RSLV_STATUS_VALID) {
+		resolution->status = RSLV_STATUS_VALID;
+		resolution->last_status_change = now_ms;
+	}
+
+	/* save the first ip we found */
+	chunk_printf(chk, "%s/%s", nameserver->resolvers->id, nameserver->id);
+	update_server_addr(s, firstip, firstip_sin_family, (char *)chk->str);
+
+ stop_resolution:
+	/* update last resolution date and time */
+	resolution->last_resolution = now_ms;
+	/* reset current status flag */
+	resolution->step = RSLV_STEP_NONE;
+	/* reset values */
+	dns_reset_resolution(resolution);
+
+	dns_update_resolvers_timeout(nameserver->resolvers);
+
+	snr_update_srv_status(s);
+	return 0;
+
+ invalid:
+	nameserver->counters.invalid += 1;
+	if (resolution->nb_responses >= nameserver->resolvers->count_nameservers)
+		goto stop_resolution;
+
+	snr_update_srv_status(s);
+	return 0;
+}
+
+/*
+ * Server Name Resolution error management callback
+ * returns:
+ *  0 on error
+ *  1 when no error or safe ignore
+ */
+int snr_resolution_error_cb(struct dns_resolution *resolution, int error_code)
+{
+	struct server *s;
+	struct dns_resolvers *resolvers;
+	int res_preferred_afinet, res_preferred_afinet6;
+
+	/* shortcut to the server whose name is being resolved */
+	s = (struct server *)resolution->requester;
+	resolvers = resolution->resolvers;
+
+	/* can be ignored if this is not the last response */
+	if ((error_code != DNS_RESP_TIMEOUT) && (resolution->nb_responses < resolvers->count_nameservers)) {
+		return 1;
+	}
+
+	switch (error_code) {
+		case DNS_RESP_INVALID:
+		case DNS_RESP_WRONG_NAME:
+			if (resolution->status != RSLV_STATUS_INVALID) {
+				resolution->status = RSLV_STATUS_INVALID;
+				resolution->last_status_change = now_ms;
+			}
+			break;
+
+		case DNS_RESP_ANCOUNT_ZERO:
+		case DNS_RESP_TRUNCATED:
+		case DNS_RESP_ERROR:
+		case DNS_RESP_NO_EXPECTED_RECORD:
+			res_preferred_afinet = resolution->resolver_family_priority == AF_INET && resolution->query_type == DNS_RTYPE_A;
+			res_preferred_afinet6 = resolution->resolver_family_priority == AF_INET6 && resolution->query_type == DNS_RTYPE_AAAA;
+
+			if ((res_preferred_afinet || res_preferred_afinet6)
+				       || (resolution->try > 0)) {
+				/* let's change the query type */
+				if (res_preferred_afinet6) {
+					/* fallback from AAAA to A */
+					resolution->query_type = DNS_RTYPE_A;
+				}
+				else if (res_preferred_afinet) {
+					/* fallback from A to AAAA */
+					resolution->query_type = DNS_RTYPE_AAAA;
+				}
+				else {
+					resolution->try -= 1;
+					if (resolution->resolver_family_priority == AF_INET) {
+						resolution->query_type = DNS_RTYPE_A;
+					} else {
+						resolution->query_type = DNS_RTYPE_AAAA;
+					}
+				}
+
+				dns_send_query(resolution);
+
+				/*
+				 * move the resolution to the last element of the FIFO queue
+				 * and update timeout wakeup based on the new first entry
+				 */
+				if (dns_check_resolution_queue(resolvers) > 1) {
+					/* second resolution becomes first one */
+					LIST_DEL(&resolution->list);
+					/* ex first resolution goes to the end of the queue */
+					LIST_ADDQ(&resolvers->curr_resolution, &resolution->list);
+				}
+				dns_update_resolvers_timeout(resolvers);
+				goto leave;
+			}
+			else {
+				if (resolution->status != RSLV_STATUS_OTHER) {
+					resolution->status = RSLV_STATUS_OTHER;
+					resolution->last_status_change = now_ms;
+				}
+			}
+			break;
+
+		case DNS_RESP_NX_DOMAIN:
+			if (resolution->status != RSLV_STATUS_NX) {
+				resolution->status = RSLV_STATUS_NX;
+				resolution->last_status_change = now_ms;
+			}
+			break;
+
+		case DNS_RESP_REFUSED:
+			if (resolution->status != RSLV_STATUS_REFUSED) {
+				resolution->status = RSLV_STATUS_REFUSED;
+				resolution->last_status_change = now_ms;
+			}
+			break;
+
+		case DNS_RESP_CNAME_ERROR:
+			break;
+
+		case DNS_RESP_TIMEOUT:
+			if (resolution->status != RSLV_STATUS_TIMEOUT) {
+				resolution->status = RSLV_STATUS_TIMEOUT;
+				resolution->last_status_change = now_ms;
+			}
+			break;
+	}
+
+	/* update last resolution date and time */
+	resolution->last_resolution = now_ms;
+	/* reset current status flag */
+	resolution->step = RSLV_STEP_NONE;
+	/* reset values */
+	dns_reset_resolution(resolution);
+
+	LIST_DEL(&resolution->list);
+	dns_update_resolvers_timeout(resolvers);
+
+ leave:
+	snr_update_srv_status(s);
+	return 1;
 }
 
 /*

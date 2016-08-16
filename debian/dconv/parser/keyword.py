@@ -6,9 +6,9 @@ class Parser(parser.Parser):
     def __init__(self, pctxt):
         parser.Parser.__init__(self, pctxt)
         self.keywordPattern = re.compile(r'^(%s%s)(%s)' % (
-            '([a-z][a-z0-9\-_\.]*[a-z0-9\-_)])', # keyword
+            '([a-z][a-z0-9\-\+_\.]*[a-z0-9\-\+_)])', # keyword
             '( [a-z0-9\-_]+)*',                  # subkeywords
-            '(\((&lt;[a-z0-9]+&gt;)((\[?,|/)(&lt;[a-z0-9]+&gt;)(\]?))*\))?'   # arg (ex: (<backend>), (<frontend>/<backend>), (<offset1>,<length>[,<offset2>]) ...
+            '(\([^ ]*\))?',   # arg (ex: (<backend>), (<frontend>/<backend>), (<offset1>,<length>[,<offset2>]) ...
         ))
 
     def parse(self, line):
@@ -22,14 +22,18 @@ class Parser(parser.Parser):
         if line != "" and not re.match(r'^ ', line):
             parsed = self.keywordPattern.match(line)
             if parsed != None:
-
                 keyword = parsed.group(1)
                 arg     = parsed.group(4)
                 parameters = line[len(keyword) + len(arg):]
-                if parameters != "" and not re.match("^ +(&lt;|\[|\{|/|\(deprecated\))", parameters):
+                if (parameters != "" and not re.match("^ +((&lt;|\[|\{|/).*|(: [a-z +]+))?(\(deprecated\))?$", parameters)):
+                    # Dirty hack
+                    # - parameters should only start with the characer "<", "[", "{", "/"
+                    # - or a column (":") followed by a alpha keywords to identify fetching samples (optionally separated by the character "+")
+                    # - or the string "(deprecated)" at the end
                     keyword = False
                 else:
                     splitKeyword = keyword.split(" ")
+
                 parameters = arg + parameters
             else:
                 keyword = False

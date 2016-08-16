@@ -25,10 +25,16 @@
 #include <netinet/in.h>
 
 #include <common/config.h>
+#include <common/standard.h>
+#include <import/da.h>
 #include <types/freq_ctr.h>
 #include <types/listener.h>
 #include <types/proxy.h>
 #include <types/task.h>
+
+#ifdef USE_51DEGREES
+#include <import/51d.h>
+#endif
 
 #ifndef UNIX_MAX_PATH
 #define UNIX_MAX_PATH 108
@@ -46,8 +52,7 @@
 
 /* list of last checks to perform, depending on config options */
 #define LSTCHK_CAP_BIND	0x00000001	/* check that we can bind to any port */
-#define LSTCHK_CTTPROXY	0x00000002	/* check that tproxy is enabled */
-#define LSTCHK_NETADM	0x00000004	/* check that we have CAP_NET_ADMIN */
+#define LSTCHK_NETADM	0x00000002	/* check that we have CAP_NET_ADMIN */
 
 /* Global tuning options */
 /* available polling mechanisms */
@@ -79,10 +84,15 @@ struct global {
 #endif
 	int uid;
 	int gid;
+	int external_check;
 	int nbproc;
 	int maxconn, hardmaxconn;
-#ifdef USE_OPENSSL
 	int maxsslconn;
+	int ssl_session_max_cost;   /* how many bytes an SSL session may cost */
+	int ssl_handshake_max_cost; /* how many bytes an SSL handshake may use */
+	int ssl_used_frontend;      /* non-zero if SSL is used in a frontend */
+	int ssl_used_backend;       /* non-zero if SSL is used in a backend */
+#ifdef USE_OPENSSL
 	char *listen_default_ciphers;
 	char *connect_default_ciphers;
 	int listen_default_ssloptions;
@@ -105,7 +115,8 @@ struct global {
 	int maxpipes;		/* max # of pipes */
 	int maxsock;		/* max # of sockets */
 	int rlimit_nofile;	/* default ulimit-n value : 0=unset */
-	int rlimit_memmax;	/* default ulimit-d in megs value : 0=unset */
+	int rlimit_memmax_all;	/* default all-process memory limit in megs ; 0=unset */
+	int rlimit_memmax;	/* default per-process memory limit in megs ; 0=unset */
 	long maxzlibmem;        /* max RAM for zlib in bytes */
 	int mode;
 	unsigned int req_count; /* request counter (HTTP or TCP session) for logs and unique_id */
@@ -116,9 +127,11 @@ struct global {
 	char *chroot;
 	char *pidfile;
 	char *node, *desc;		/* node name & description */
-	char *log_tag;                  /* name for syslog */
+	struct chunk log_tag;           /* name for syslog */
 	struct list logsrvs;
 	char *log_send_hostname;   /* set hostname in syslog header */
+	char *server_state_base;   /* path to a directory where server state files can be found */
+	char *server_state_file;   /* path to the file where server states are loaded from */
 	struct {
 		int maxpollevents; /* max number of poll events at once */
 		int maxaccept;     /* max number of consecutive accept() */
@@ -126,6 +139,8 @@ struct global {
 		int recv_enough;   /* how many input bytes at once are "enough" */
 		int bufsize;       /* buffer size in bytes, defaults to BUFSIZE */
 		int maxrewrite;    /* buffer max rewrite size in bytes, defaults to MAXREWRITE */
+		int reserved_bufs; /* how many buffers can only be allocated for response */
+		int buf_limit;     /* if not null, how many total buffers may only be allocated */
 		int client_sndbuf; /* set client sndbuf to this value if not null */
 		int client_rcvbuf; /* set client rcvbuf to this value if not null */
 		int server_sndbuf; /* set server sndbuf to this value if not null */
@@ -134,12 +149,14 @@ struct global {
 		int pipesize;      /* pipe size in bytes, system defaults if zero */
 		int max_http_hdr;  /* max number of HTTP headers, use MAX_HTTP_HDR if zero */
 		int cookie_len;    /* max length of cookie captures */
-#ifdef USE_OPENSSL
+		int pattern_cache; /* max number of entries in the pattern cache. */
 		int sslcachesize;  /* SSL cache size in session, defaults to 20000 */
+#ifdef USE_OPENSSL
 		int sslprivatecache; /* Force to use a private session cache even if nbproc > 1 */
 		unsigned int ssllifetime;   /* SSL session lifetime in seconds */
 		unsigned int ssl_max_record; /* SSL max record size */
 		unsigned int ssl_default_dh_param; /* SSL maximum DH parameter size */
+		int ssl_ctx_cache; /* max number of entries in the ssl_ctx cache. */
 #endif
 #ifdef USE_ZLIB
 		int zlibmemlevel;    /* zlib memlevel */
@@ -160,6 +177,37 @@ struct global {
 	unsigned long cpu_map[LONGBITS];  /* list of CPU masks for the 32/64 first processes */
 #endif
 	struct proxy *stats_fe;     /* the frontend holding the stats settings */
+#ifdef USE_DEVICEATLAS
+	struct {
+		void *atlasimgptr;
+		char *jsonpath;
+		char *cookiename;
+		size_t cookienamelen;
+		da_atlas_t atlas;
+		da_evidence_id_t useragentid;
+		da_severity_t loglevel;
+		char separator;
+		unsigned char daset:1;
+	} deviceatlas;
+#endif
+#ifdef USE_51DEGREES
+	struct {
+		char property_separator;    /* the separator to use in the response for the values. this is taken from 51degrees-property-separator from config. */
+		struct list property_names; /* list of properties to load into the data set. this is taken from 51degrees-property-name-list from config. */
+		char *data_file_path;
+		int header_count; /* number of HTTP headers related to device detection. */
+		struct chunk *header_names; /* array of HTTP header names. */
+#ifdef FIFTYONEDEGREES_H_PATTERN_INCLUDED
+		fiftyoneDegreesDataSet data_set; /* data set used with the pattern detection method. */
+		fiftyoneDegreesWorksetPool *pool; /* pool of worksets to avoid creating a new one for each request. */
+#endif
+#ifdef FIFTYONEDEGREES_H_TRIE_INCLUDED
+		int32_t *header_offsets; /* offsets to the HTTP header name string. */
+		fiftyoneDegreesDeviceOffsets device_offsets; /* Memory used for device offsets. */
+#endif
+		int cache_size;
+	} _51degrees;
+#endif
 };
 
 extern struct global global;
@@ -180,10 +228,11 @@ extern char localpeer[MAX_HOSTNAME_LEN];
 extern struct list global_listener_queue; /* list of the temporarily limited listeners */
 extern struct task *global_listener_queue_task;
 extern unsigned int warned;     /* bitfield of a few warnings to emit just once */
+extern struct list dns_resolvers;
 
 /* bit values to go with "warned" above */
 #define WARN_BLOCK_DEPRECATED       0x00000001
-#define WARN_REQSETBE_DEPRECATED    0x00000002
+/* unassigned : 0x00000002 */
 #define WARN_REDISPATCH_DEPRECATED  0x00000004
 #define WARN_CLITO_DEPRECATED       0x00000008
 #define WARN_SRVTO_DEPRECATED       0x00000010

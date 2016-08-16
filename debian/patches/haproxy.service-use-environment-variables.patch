@@ -10,18 +10,17 @@ Index: haproxy/contrib/systemd/haproxy.service.in
 ===================================================================
 --- haproxy.orig/contrib/systemd/haproxy.service.in
 +++ haproxy/contrib/systemd/haproxy.service.in
-@@ -6,9 +6,11 @@ After=network.target syslog.service
- Wants=syslog.service
+@@ -7,9 +7,10 @@ Wants=syslog.service
  
  [Service]
--ExecStartPre=@SBINDIR@/haproxy -f /etc/haproxy/haproxy.cfg -c -q
--ExecStart=@SBINDIR@/haproxy-systemd-wrapper -f /etc/haproxy/haproxy.cfg -p /run/haproxy.pid
--ExecReload=@SBINDIR@/haproxy -c -f /etc/haproxy/haproxy.cfg
-+Environment=CONFIG=/etc/haproxy/haproxy.cfg
+ Environment="CONFIG=/etc/haproxy/haproxy.cfg" "PIDFILE=/run/haproxy.pid"
+-ExecStartPre=@SBINDIR@/haproxy -f $CONFIG -c -q
+-ExecStart=@SBINDIR@/haproxy-systemd-wrapper -f $CONFIG -p $PIDFILE
+-ExecReload=@SBINDIR@/haproxy -f $CONFIG -c -q
 +EnvironmentFile=-/etc/default/haproxy
-+ExecStartPre=@SBINDIR@/haproxy -f ${CONFIG} -c -q
-+ExecStart=@SBINDIR@/haproxy-systemd-wrapper -f ${CONFIG} -p /run/haproxy.pid $EXTRAOPTS
-+ExecReload=@SBINDIR@/haproxy -c -f ${CONFIG}
++ExecStartPre=@SBINDIR@/haproxy -f $CONFIG -c -q $EXTRAOPTS
++ExecStart=@SBINDIR@/haproxy-systemd-wrapper -f $CONFIG -p $PIDFILE $EXTRAOPTS
++ExecReload=@SBINDIR@/haproxy -f $CONFIG -c -q $EXTRAOPTS
  ExecReload=/bin/kill -USR2 $MAINPID
  KillMode=mixed
  Restart=always

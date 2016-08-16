@@ -31,7 +31,6 @@
 #include <types/pattern.h>
 #include <types/proxy.h>
 #include <types/server.h>
-#include <types/session.h>
 
 #include <ebmbtree.h>
 
@@ -74,7 +73,7 @@ enum acl_cond_pol {
 
 /* some dummy declarations to silent the compiler */
 struct proxy;
-struct session;
+struct stream;
 
 /*
  * ACL keyword: Associates keywords with parsers, methods to retrieve the value and testers.

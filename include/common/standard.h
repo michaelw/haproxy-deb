@@ -25,10 +25,12 @@
 #include <limits.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <common/chunk.h>
 #include <common/config.h>
 #include <eb32tree.h>
@@ -104,6 +106,8 @@ extern int strlcpy2(char *dst, const char *src, int size);
  */
 extern char itoa_str[][171];
 extern char *ultoa_r(unsigned long n, char *buffer, int size);
+extern char *lltoa_r(long long int n, char *buffer, int size);
+extern char *sltoa_r(long n, char *buffer, int size);
 extern const char *ulltoh_r(unsigned long long n, char *buffer, int size);
 static inline const char *ultoa(unsigned long n)
 {
@@ -242,6 +246,8 @@ static inline int hex2i(int c)
 	return c;
 }
 
+/* rounds <i> down to the closest value having max 2 digits */
+unsigned int round_2dig(unsigned int i);
 
 /*
  * Checks <name> for invalid characters. Valid chars are [A-Za-z0-9_:.-]. If an
@@ -269,9 +275,10 @@ extern const char *invalid_domainchar(const char *name);
  * The IPv6 '::' address is IN6ADDR_ANY, so in order to bind to a given port on
  * IPv6, use ":::port". NULL is returned if the host part cannot be resolved.
  * If <pfx> is non-null, it is used as a string prefix before any path-based
- * address (typically the path to a unix socket).
+ * address (typically the path to a unix socket). If use_dns is not true,
+ * the funtion cannot accept the DNS resolution.
  */
-struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char **err, const char *pfx);
+struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char **err, const char *pfx, char **fqdn, int use_dns);
 
 /* converts <str> to a struct in_addr containing a network mask. It can be
  * passed in dotted form (255.255.255.0) or in CIDR form (24). It returns 1
@@ -291,6 +298,31 @@ int cidr2dotted(int cidr, struct in_addr *mask);
  * Note: "addr" can also be a hostname. Returns 1 if OK, 0 if error.
  */
 int str2net(const char *str, int resolve, struct in_addr *addr, struct in_addr *mask);
+
+/* str2ip and str2ip2:
+ *
+ * converts <str> to a struct sockaddr_storage* provided by the caller. The
+ * caller must have zeroed <sa> first, and may have set sa->ss_family to force
+ * parse a specific address format. If the ss_family is 0 or AF_UNSPEC, then
+ * the function tries to guess the address family from the syntax. If the
+ * family is forced and the format doesn't match, an error is returned. The
+ * string is assumed to contain only an address, no port. The address can be a
+ * dotted IPv4 address, an IPv6 address, a host name, or empty or "*" to
+ * indicate INADDR_ANY. NULL is returned if the host part cannot be resolved.
+ * The return address will only have the address family and the address set,
+ * all other fields remain zero. The string is not supposed to be modified.
+ * The IPv6 '::' address is IN6ADDR_ANY.
+ *
+ * str2ip2:
+ *
+ * If <resolve> is set, this function try to resolve DNS, otherwise, it returns
+ * NULL result.
+ */
+struct sockaddr_storage *str2ip2(const char *str, struct sockaddr_storage *sa, int resolve);
+static inline struct sockaddr_storage *str2ip(const char *str, struct sockaddr_storage *sa)
+{
+	return str2ip2(str, sa, 1);
+}
 
 /*
  * converts <str> to two struct in6_addr* which must be pre-allocated.
@@ -348,6 +380,33 @@ char *encode_chunk(char *start, char *stop,
                    const char escape, const fd_set *map,
                    const struct chunk *chunk);
 
+
+/* Check a string for using it in a CSV output format. If the string contains
+ * one of the following four char <">, <,>, CR or LF, the string is
+ * encapsulated between <"> and the <"> are escaped by a <""> sequence.
+ * <str> is the input string to be escaped. The function assumes that
+ * the input string is null-terminated.
+ *
+ * If <quote> is 0, the result is returned escaped but without double quote.
+ * Is it useful if the escaped string is used between double quotes in the
+ * format.
+ *
+ *    printf("..., \"%s\", ...\r\n", csv_enc(str, 0));
+ *
+ * If the <quote> is 1, the converter put the quotes only if any character is
+ * escaped. If the <quote> is 2, the converter put always the quotes.
+ *
+ * <output> is a struct chunk used for storing the output string if any
+ * change will be done.
+ *
+ * The function returns the converted string on this output. If an error
+ * occurs, the function return an empty string. This type of output is useful
+ * for using the function directly as printf() argument.
+ *
+ * If the output buffer is too short to conatin the input string, the result
+ * is truncated.
+ */
+const char *csv_enc(const char *str, int quote, struct chunk *output);
 
 /* Decode an URL-encoded string in-place. The resulting string might
  * be shorter. If some forbidden characters are found, the conversion is
@@ -438,6 +497,9 @@ static inline unsigned int __read_uint(const char **s, const char *end)
 	*s = ptr;
 	return i;
 }
+
+unsigned long long int read_uint64(const char **s, const char *end);
+long long int read_int64(const char **s, const char *end);
 
 extern unsigned int str2ui(const char *s);
 extern unsigned int str2uic(const char *s);
@@ -751,10 +813,10 @@ static inline int set_host_port(struct sockaddr_storage *addr, int port)
 }
 
 /* Return true if IPv4 address is part of the network */
-extern int in_net_ipv4(struct in_addr *addr, struct in_addr *mask, struct in_addr *net);
+extern int in_net_ipv4(const void *addr, const struct in_addr *mask, const struct in_addr *net);
 
 /* Return true if IPv6 address is part of the network */
-extern int in_net_ipv6(struct in6_addr *addr, struct in6_addr *mask, struct in6_addr *net);
+extern int in_net_ipv6(const void *addr, const struct in6_addr *mask, const struct in6_addr *net);
 
 /* Map IPv4 adress on IPv6 address, as specified in RFC 3513. */
 extern void v4tov6(struct in6_addr *sin6_addr, struct in_addr *sin_addr);
@@ -768,9 +830,6 @@ char *human_time(int t, short hz_div);
 
 extern const char *monthname[];
 
-/* numeric timezone (that is, the hour and minute offset from UTC) */
-char localtimezone[6];
-
 /* date2str_log: write a date in the format :
  * 	sprintf(str, "%02d/%s/%04d:%02d:%02d:%02d.%03d",
  *		tm.tm_mday, monthname[tm.tm_mon], tm.tm_year+1900,
@@ -781,6 +840,13 @@ char localtimezone[6];
  */
 char *date2str_log(char *dest, struct tm *tm, struct timeval *date, size_t size);
 
+/* Return the GMT offset for a specific local time.
+ * Both t and tm must represent the same time.
+ * The string returned has the same format as returned by strftime(... "%z", tm).
+ * Offsets are kept in an internal cache for better performances.
+ */
+const char *get_gmt_offset(time_t t, struct tm *tm);
+
 /* gmt2str_log: write a date in the format :
  * "%02d/%s/%04d:%02d:%02d:%02d +0000" without using snprintf
  * return a pointer to the last char written (\0) or
@@ -790,10 +856,11 @@ char *gmt2str_log(char *dst, struct tm *tm, size_t size);
 
 /* localdate2str_log: write a date in the format :
  * "%02d/%s/%04d:%02d:%02d:%02d +0000(local timezone)" without using snprintf
+ * Both t and tm must represent the same time.
  * return a pointer to the last char written (\0) or
  * NULL if there isn't enough space.
  */
-char *localdate2str_log(char *dst, struct tm *tm, size_t size);
+char *localdate2str_log(char *dst, time_t t, struct tm *tm, size_t size);
 
 /* Dynamically allocates a string of the proper length to hold the formatted
  * output. NULL is returned on error. The caller is responsible for freeing the
@@ -912,6 +979,90 @@ static inline unsigned long caddr_set_flags(unsigned long caddr, unsigned int da
 static inline unsigned long caddr_clr_flags(unsigned long caddr, unsigned int data)
 {
 	return caddr & ~(unsigned long)(data & 3);
+}
+
+/* UTF-8 decoder status */
+#define UTF8_CODE_OK       0x00
+#define UTF8_CODE_OVERLONG 0x10
+#define UTF8_CODE_INVRANGE 0x20
+#define UTF8_CODE_BADSEQ   0x40
+
+unsigned char utf8_next(const char *s, int len, unsigned int *c);
+
+static inline unsigned char utf8_return_code(unsigned int code)
+{
+	return code & 0xf0;
+}
+
+static inline unsigned char utf8_return_length(unsigned char code)
+{
+	return code & 0x0f;
+}
+
+/* Turns 64-bit value <a> from host byte order to network byte order.
+ * The principle consists in letting the compiler detect we're playing
+ * with a union and simplify most or all operations. The asm-optimized
+ * htonl() version involving bswap (x86) / rev (arm) / other is a single
+ * operation on little endian, or a NOP on big-endian. In both cases,
+ * this lets the compiler "see" that we're rebuilding a 64-bit word from
+ * two 32-bit quantities that fit into a 32-bit register. In big endian,
+ * the whole code is optimized out. In little endian, with a decent compiler,
+ * a few bswap and 2 shifts are left, which is the minimum acceptable.
+ */
+static inline unsigned long long my_htonll(unsigned long long a)
+{
+	union {
+		struct {
+			unsigned int w1;
+			unsigned int w2;
+		} by32;
+		unsigned long long by64;
+	} w = { .by64 = a };
+	return ((unsigned long long)htonl(w.by32.w1) << 32) | htonl(w.by32.w2);
+}
+
+/* Turns 64-bit value <a> from network byte order to host byte order. */
+static inline unsigned long long my_ntohll(unsigned long long a)
+{
+	return my_htonll(a);
+}
+
+/* returns a 64-bit a timestamp with the finest resolution available. The
+ * unit is intentionally not specified. It's mostly used to compare dates.
+ */
+#if defined(__i386__) || defined(__x86_64__)
+static inline unsigned long long rdtsc()
+{
+     unsigned int a, d;
+     asm volatile("rdtsc" : "=a" (a), "=d" (d));
+     return a + ((unsigned long long)d << 32);
+}
+#else
+static inline unsigned long long rdtsc()
+{
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return tv.tv_sec * 1000000 + tv.tv_usec;
+}
+#endif
+
+/* append a copy of string <str> (in a wordlist) at the end of the list <li>
+ * On failure : return 0 and <err> filled with an error message.
+ * The caller is responsible for freeing the <err> and <str> copy
+ * memory area using free()
+ */
+struct list;
+int list_append_word(struct list *li, const char *str, char **err);
+
+/* same as realloc() except that ptr is also freed upon failure */
+static inline void *my_realloc2(void *ptr, size_t size)
+{
+	void *ret;
+
+	ret = realloc(ptr, size);
+	if (!ret && size)
+		free(ptr);
+	return ret;
 }
 
 #endif /* _COMMON_STANDARD_H */

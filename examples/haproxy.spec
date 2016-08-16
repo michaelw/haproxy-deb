@@ -1,6 +1,6 @@
 Summary: HA-Proxy is a TCP/HTTP reverse proxy for high availability environments
 Name: haproxy
-Version: 1.5.14
+Version: 1.6.8
 Release: 1
 License: GPL
 Group: System Environment/Daemons
@@ -44,7 +44,6 @@ risking the system's stability.
 %{__install} -d %{buildroot}%{_mandir}/man1/
 
 %{__install} -s %{name} %{buildroot}%{_sbindir}/
-%{__install} -c -m 644 examples/%{name}.cfg %{buildroot}%{_sysconfdir}/%{name}/
 %{__install} -c -m 755 examples/%{name}.init %{buildroot}%{_sysconfdir}/rc.d/init.d/%{name}
 %{__install} -c -m 755 doc/%{name}.1 %{buildroot}%{_mandir}/man1/
  
@@ -67,56 +66,67 @@ fi
 
 %files
 %defattr(-,root,root)
-%doc CHANGELOG README examples/*.cfg doc/haproxy-en.txt doc/haproxy-fr.txt doc/architecture.txt doc/configuration.txt doc/proxy-protocol.txt
+%doc CHANGELOG README doc/architecture.txt doc/configuration.txt doc/intro.txt doc/management.txt doc/proxy-protocol.txt
 %doc %{_mandir}/man1/%{name}.1*
 
 %attr(0755,root,root) %{_sbindir}/%{name}
 %dir %{_sysconfdir}/%{name}
-%attr(0644,root,root) %config(noreplace) %{_sysconfdir}/%{name}/%{name}.cfg
 %attr(0755,root,root) %config %{_sysconfdir}/rc.d/init.d/%{name}
 
 %changelog
-* Fri Jul  3 2015 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.14
+* Sun Aug 14 2016 Willy Tarreau <w@1wt.eu>
+- updated to 1.6.8
 
-* Fri Jun 26 2015 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.13
+* Wed Jul 13 2016 Willy Tarreau <w@1wt.eu>
+- updated to 1.6.7
 
-* Sat May  2 2015 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.12
+* Sun Jun 26 2016 Willy Tarreau <w@1wt.eu>
+- updated to 1.6.6
 
-* Sun Feb  1 2015 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.11
+* Tue May 10 2016 Willy Tarreau <w@1wt.eu>
+- updated to 1.6.5
 
-* Wed Dec 31 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.10
+* Mon Mar 14 2016 Willy Tarreau <w@1wt.eu>
+- updated to 1.6.4
 
-* Wed Nov 26 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.9
+* Sun Dec 27 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6.3
 
-* Fri Oct 31 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.8
+* Tue Nov  3 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6.2
 
-* Thu Oct 30 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.7
+* Tue Oct 20 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6.1
 
-* Sat Oct 18 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.6
+* Tue Oct 13 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6.0
 
-* Wed Oct  8 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.5
+* Tue Oct  6 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6-dev7
 
-* Tue Sep  2 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.4
+* Mon Sep 28 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6-dev6
 
-* Fri Jul 25 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.3
+* Mon Sep 14 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6-dev5
 
-* Sat Jul 12 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.2
+* Sun Aug 30 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6-dev4
 
-* Tue Jun 24 2014 Willy Tarreau <w@1wt.eu>
-- updated to 1.5.1
+* Sun Aug 30 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6-dev4
+
+* Wed Jul 22 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6-dev3
+
+* Wed Jun 17 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6-dev2
+
+* Wed Mar 11 2015 Willy Tarreau <w@1wt.eu>
+- updated to 1.6-dev1
+
+* Thu Jun 19 2014 Willy Tarreau <w@1wt.eu>
+- updated to 1.6-dev0
 
 * Thu Jun 19 2014 Willy Tarreau <w@1wt.eu>
 - updated to 1.5.0

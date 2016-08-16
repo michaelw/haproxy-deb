@@ -25,6 +25,7 @@
 #include <common/config.h>
 #include <common/standard.h>
 #include <types/global.h>
+#include <proto/dns.h>
 #include <eb32tree.h>
 
 /* enough to store NB_ITOA_STR integers of :
@@ -407,6 +408,51 @@ char *ultoa_r(unsigned long n, char *buffer, int size)
 
 /*
  * This function simply returns a locally allocated string containing
+ * the ascii representation for number 'n' in decimal.
+ */
+char *lltoa_r(long long int in, char *buffer, int size)
+{
+	char *pos;
+	int neg = 0;
+	unsigned long long int n;
+
+	pos = buffer + size - 1;
+	*pos-- = '\0';
+
+	if (in < 0) {
+		neg = 1;
+		n = -in;
+	}
+	else
+		n = in;
+
+	do {
+		*pos-- = '0' + n % 10;
+		n /= 10;
+	} while (n && pos >= buffer);
+	if (neg && pos > buffer)
+		*pos-- = '-';
+	return pos + 1;
+}
+
+/*
+ * This function simply returns a locally allocated string containing
+ * the ascii representation for signed number 'n' in decimal.
+ */
+char *sltoa_r(long n, char *buffer, int size)
+{
+	char *pos;
+
+	if (n >= 0)
+		return ultoa_r(n, buffer, size);
+
+	pos = ultoa_r(-n, buffer + 1, size - 1) - 1;
+	*pos = '-';
+	return pos;
+}
+
+/*
+ * This function simply returns a locally allocated string containing
  * the ascii representation for number 'n' in decimal, formatted for
  * HTML output with tags to create visual grouping by 3 digits. The
  * output needs to support at least 171 characters.
@@ -504,6 +550,18 @@ int ishex(char s)
 	return 0;
 }
 
+/* rounds <i> down to the closest value having max 2 digits */
+unsigned int round_2dig(unsigned int i)
+{
+	unsigned int mul = 1;
+
+	while (i >= 100) {
+		i /= 10;
+		mul *= 10;
+	}
+	return i * mul;
+}
+
 /*
  * Checks <name> for invalid characters. Valid chars are [A-Za-z0-9_:.-]. If an
  * invalid character is found, a pointer to it is returned. If everything is
@@ -555,9 +613,11 @@ const char *invalid_domainchar(const char *name) {
  * indicate INADDR_ANY. NULL is returned if the host part cannot be resolved.
  * The return address will only have the address family and the address set,
  * all other fields remain zero. The string is not supposed to be modified.
- * The IPv6 '::' address is IN6ADDR_ANY.
+ * The IPv6 '::' address is IN6ADDR_ANY. If <resolve> is non-zero, the hostname
+ * is resolved, otherwise only IP addresses are resolved, and anything else
+ * returns NULL.
  */
-static struct sockaddr_storage *str2ip(const char *str, struct sockaddr_storage *sa)
+struct sockaddr_storage *str2ip2(const char *str, struct sockaddr_storage *sa, int resolve)
 {
 	struct hostent *he;
 
@@ -591,6 +651,12 @@ static struct sockaddr_storage *str2ip(const char *str, struct sockaddr_storage 
 		return sa;
 	}
 
+	if (!resolve)
+		return NULL;
+
+	if (!dns_hostname_validation(str, NULL))
+		return NULL;
+
 #ifdef USE_GETADDRINFO
 	if (global.tune.options & GTUNE_USE_GAI) {
 		struct addrinfo hints, *result;
@@ -599,7 +665,7 @@ static struct sockaddr_storage *str2ip(const char *str, struct sockaddr_storage 
 		memset(&hints, 0, sizeof(hints));
 		hints.ai_family = sa->ss_family ? sa->ss_family : AF_UNSPEC;
 		hints.ai_socktype = SOCK_DGRAM;
-		hints.ai_flags = AI_PASSIVE;
+		hints.ai_flags = 0;
 		hints.ai_protocol = 0;
 
 		if (getaddrinfo(str, NULL, &hints, &result) == 0) {
@@ -689,10 +755,17 @@ static struct sockaddr_storage *str2ip(const char *str, struct sockaddr_storage 
  * If <pfx> is non-null, it is used as a string prefix before any path-based
  * address (typically the path to a unix socket).
  *
+ * if <fqdn> is non-null, it will be filled with :
+ *   - a pointer to the FQDN of the server name to resolve if there's one, and
+ *     that the caller will have to free(),
+ *   - NULL if there was an explicit address that doesn't require resolution.
+ *
+ * Hostnames are only resolved if <resolve> is non-null.
+ *
  * When a file descriptor is passed, its value is put into the s_addr part of
  * the address when cast to sockaddr_in and the address family is AF_UNSPEC.
  */
-struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char **err, const char *pfx)
+struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char **err, const char *pfx, char **fqdn, int resolve)
 {
 	static struct sockaddr_storage ss;
 	struct sockaddr_storage *ret = NULL;
@@ -702,10 +775,17 @@ struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char
 	int abstract = 0;
 
 	portl = porth = porta = 0;
+	if (fqdn)
+		*fqdn = NULL;
 
 	str2 = back = env_expand(strdup(str));
 	if (str2 == NULL) {
 		memprintf(err, "out of memory in '%s'\n", __FUNCTION__);
+		goto out;
+	}
+
+	if (!*str2) {
+		memprintf(err, "'%s' resolves to an empty address (environment variable missing?)\n", str);
 		goto out;
 	}
 
@@ -774,15 +854,20 @@ struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char
 		memcpy(((struct sockaddr_un *)&ss)->sun_path + prefix_path_len + abstract, str2, adr_len + 1 - abstract);
 	}
 	else { /* IPv4 and IPv6 */
+		int use_fqdn = 0;
+
 		port1 = strrchr(str2, ':');
 		if (port1)
 			*port1++ = '\0';
 		else
 			port1 = "";
 
-		if (str2ip(str2, &ss) == NULL) {
-			memprintf(err, "invalid address: '%s' in '%s'\n", str2, str);
-			goto out;
+		if (str2ip2(str2, &ss, 0) == NULL) {
+			use_fqdn = 1;
+			if (!resolve || str2ip2(str2, &ss, 1) == NULL) {
+				memprintf(err, "invalid address: '%s' in '%s'\n", str2, str);
+				goto out;
+			}
 		}
 
 		if (isdigit((int)(unsigned char)*port1)) {	/* single port or range */
@@ -808,6 +893,13 @@ struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char
 			goto out;
 		}
 		set_host_port(&ss, porta);
+
+		if (use_fqdn && fqdn) {
+			if (str2 != back)
+				memmove(back, str2, strlen(str2) + 1);
+			*fqdn = back;
+			back = NULL;
+		}
 	}
 
 	ret = &ss;
@@ -1293,6 +1385,70 @@ char *encode_chunk(char *start, char *stop,
 	return start;
 }
 
+/* Check a string for using it in a CSV output format. If the string contains
+ * one of the following four char <">, <,>, CR or LF, the string is
+ * encapsulated between <"> and the <"> are escaped by a <""> sequence.
+ * <str> is the input string to be escaped. The function assumes that
+ * the input string is null-terminated.
+ *
+ * If <quote> is 0, the result is returned escaped but without double quote.
+ * Is it useful if the escaped string is used between double quotes in the
+ * format.
+ *
+ *    printf("..., \"%s\", ...\r\n", csv_enc(str, 0));
+ *
+ * If the <quote> is 1, the converter put the quotes only if any character is
+ * escaped. If the <quote> is 2, the converter put always the quotes.
+ *
+ * <output> is a struct chunk used for storing the output string if any
+ * change will be done.
+ *
+ * The function returns the converted string on this output. If an error
+ * occurs, the function return an empty string. This type of output is useful
+ * for using the function directly as printf() argument.
+ *
+ * If the output buffer is too short to contain the input string, the result
+ * is truncated.
+ */
+const char *csv_enc(const char *str, int quote, struct chunk *output)
+{
+	char *end = output->str + output->size;
+	char *out = output->str + 1; /* +1 for reserving space for a first <"> */
+
+	while (*str && out < end - 2) { /* -2 for reserving space for <"> and \0. */
+		*out = *str;
+		if (*str == '"') {
+			if (quote == 1)
+				quote = 2;
+			out++;
+			if (out >= end - 2) {
+				out--;
+				break;
+			}
+			*out = '"';
+		}
+		if (quote == 1 && ( *str == '\r' || *str == '\n' || *str == ',') )
+			quote = 2;
+		out++;
+		str++;
+	}
+
+	if (quote == 1)
+		quote = 0;
+
+	if (!quote) {
+		*out = '\0';
+		return output->str + 1;
+	}
+
+	/* else quote == 2 */
+	*output->str = '"';
+	*out = '"';
+	out++;
+	*out = '\0';
+	return output->str;
+}
+
 /* Decode an URL-encoded string in-place. The resulting string might
  * be shorter. If some forbidden characters are found, the conversion is
  * aborted, the string is truncated before the issue and a negative value is
@@ -1351,6 +1507,81 @@ unsigned int strl2uic(const char *s, int len)
 unsigned int read_uint(const char **s, const char *end)
 {
 	return __read_uint(s, end);
+}
+
+/* This function reads an unsigned integer from the string pointed to by <s> and
+ * returns it. The <s> pointer is adjusted to point to the first unread char. The
+ * function automatically stops at <end>. If the number overflows, the 2^64-1
+ * value is returned.
+ */
+unsigned long long int read_uint64(const char **s, const char *end)
+{
+	const char *ptr = *s;
+	unsigned long long int i = 0, tmp;
+	unsigned int j;
+
+	while (ptr < end) {
+
+		/* read next char */
+		j = *ptr - '0';
+		if (j > 9)
+			goto read_uint64_end;
+
+		/* add char to the number and check overflow. */
+		tmp = i * 10;
+		if (tmp / 10 != i) {
+			i = ULLONG_MAX;
+			goto read_uint64_eat;
+		}
+		if (ULLONG_MAX - tmp < j) {
+			i = ULLONG_MAX;
+			goto read_uint64_eat;
+		}
+		i = tmp + j;
+		ptr++;
+	}
+read_uint64_eat:
+	/* eat each numeric char */
+	while (ptr < end) {
+		if ((unsigned int)(*ptr - '0') > 9)
+			break;
+		ptr++;
+	}
+read_uint64_end:
+	*s = ptr;
+	return i;
+}
+
+/* This function reads an integer from the string pointed to by <s> and returns
+ * it. The <s> pointer is adjusted to point to the first unread char. The function
+ * automatically stops at <end>. Il the number is bigger than 2^63-2, the 2^63-1
+ * value is returned. If the number is lowest than -2^63-1, the -2^63 value is
+ * returned.
+ */
+long long int read_int64(const char **s, const char *end)
+{
+	unsigned long long int i = 0;
+	int neg = 0;
+
+	/* Look for minus char. */
+	if (**s == '-') {
+		neg = 1;
+		(*s)++;
+	}
+	else if (**s == '+')
+		(*s)++;
+
+	/* convert as positive number. */
+	i = read_uint64(s, end);
+
+	if (neg) {
+		if (i > 0x8000000000000000ULL)
+			return LLONG_MIN;
+		return -i;
+	}
+	if (i > 0x7fffffffffffffffULL)
+		return LLONG_MAX;
+	return i;
 }
 
 /* This one is 7 times faster than strtol() on athlon with checks.
@@ -1644,6 +1875,9 @@ const char *parse_size_err(const char *text, unsigned *ret) {
 		return text;
 	}
 
+	if (*text != '\0' && *++text != '\0')
+		return text;
+
 	*ret = value;
 	return NULL;
 }
@@ -1699,8 +1933,10 @@ int parse_binary(const char *source, char **binstr, int *binstrlen, char **err)
 
 bad_input:
 	memprintf(err, "an hex digit is expected (found '%c')", p[i-1]);
-	if (alloc)
-		free(binstr);
+	if (alloc) {
+		free(*binstr);
+		*binstr = NULL;
+	}
 	return 0;
 }
 
@@ -2071,22 +2307,29 @@ unsigned int full_hash(unsigned int a)
 }
 
 /* Return non-zero if IPv4 address is part of the network,
- * otherwise zero.
+ * otherwise zero. Note that <addr> may not necessarily be aligned
+ * while the two other ones must.
  */
-int in_net_ipv4(struct in_addr *addr, struct in_addr *mask, struct in_addr *net)
+int in_net_ipv4(const void *addr, const struct in_addr *mask, const struct in_addr *net)
 {
-	return((addr->s_addr & mask->s_addr) == (net->s_addr & mask->s_addr));
+	struct in_addr addr_copy;
+
+	memcpy(&addr_copy, addr, sizeof(addr_copy));
+	return((addr_copy.s_addr & mask->s_addr) == (net->s_addr & mask->s_addr));
 }
 
 /* Return non-zero if IPv6 address is part of the network,
- * otherwise zero.
+ * otherwise zero. Note that <addr> may not necessarily be aligned
+ * while the two other ones must.
  */
-int in_net_ipv6(struct in6_addr *addr, struct in6_addr *mask, struct in6_addr *net)
+int in_net_ipv6(const void *addr, const struct in6_addr *mask, const struct in6_addr *net)
 {
 	int i;
+	struct in6_addr addr_copy;
 
+	memcpy(&addr_copy, addr, sizeof(addr_copy));
 	for (i = 0; i < sizeof(struct in6_addr) / sizeof(int); i++)
-		if (((((int *)addr)[i] & ((int *)mask)[i])) !=
+		if (((((int *)&addr_copy)[i] & ((int *)mask)[i])) !=
 		    (((int *)net)[i] & ((int *)mask)[i]))
 			return 0;
 	return 1;
@@ -2197,6 +2440,70 @@ char *date2str_log(char *dst, struct tm *tm, struct timeval *date, size_t size)
 	return dst;
 }
 
+/* Base year used to compute leap years */
+#define TM_YEAR_BASE 1900
+
+/* Return the difference in seconds between two times (leap seconds are ignored).
+ * Retrieved from glibc 2.18 source code.
+ */
+static int my_tm_diff(const struct tm *a, const struct tm *b)
+{
+	/* Compute intervening leap days correctly even if year is negative.
+	 * Take care to avoid int overflow in leap day calculations,
+	 * but it's OK to assume that A and B are close to each other.
+	 */
+	int a4 = (a->tm_year >> 2) + (TM_YEAR_BASE >> 2) - ! (a->tm_year & 3);
+	int b4 = (b->tm_year >> 2) + (TM_YEAR_BASE >> 2) - ! (b->tm_year & 3);
+	int a100 = a4 / 25 - (a4 % 25 < 0);
+	int b100 = b4 / 25 - (b4 % 25 < 0);
+	int a400 = a100 >> 2;
+	int b400 = b100 >> 2;
+	int intervening_leap_days = (a4 - b4) - (a100 - b100) + (a400 - b400);
+	int years = a->tm_year - b->tm_year;
+	int days = (365 * years + intervening_leap_days
+	         + (a->tm_yday - b->tm_yday));
+	return (60 * (60 * (24 * days + (a->tm_hour - b->tm_hour))
+	       + (a->tm_min - b->tm_min))
+	       + (a->tm_sec - b->tm_sec));
+}
+
+/* Return the GMT offset for a specific local time.
+ * Both t and tm must represent the same time.
+ * The string returned has the same format as returned by strftime(... "%z", tm).
+ * Offsets are kept in an internal cache for better performances.
+ */
+const char *get_gmt_offset(time_t t, struct tm *tm)
+{
+	/* Cache offsets from GMT (depending on whether DST is active or not) */
+	static char gmt_offsets[2][5+1] = { "", "" };
+
+	char *gmt_offset;
+	struct tm tm_gmt;
+	int diff;
+	int isdst = tm->tm_isdst;
+
+	/* Pretend DST not active if its status is unknown */
+	if (isdst < 0)
+		isdst = 0;
+
+	/* Fetch the offset and initialize it if needed */
+	gmt_offset = gmt_offsets[isdst & 0x01];
+	if (unlikely(!*gmt_offset)) {
+		get_gmtime(t, &tm_gmt);
+		diff = my_tm_diff(tm, &tm_gmt);
+		if (diff < 0) {
+			diff = -diff;
+			*gmt_offset = '-';
+		} else {
+			*gmt_offset = '+';
+		}
+		diff /= 60; /* Convert to minutes */
+		snprintf(gmt_offset+1, 4+1, "%02d%02d", diff/60, diff%60);
+	}
+
+    return gmt_offset;
+}
+
 /* gmt2str_log: write a date in the format :
  * "%02d/%s/%04d:%02d:%02d:%02d +0000" without using snprintf
  * return a pointer to the last char written (\0) or
@@ -2232,13 +2539,17 @@ char *gmt2str_log(char *dst, struct tm *tm, size_t size)
 
 /* localdate2str_log: write a date in the format :
  * "%02d/%s/%04d:%02d:%02d:%02d +0000(local timezone)" without using snprintf
- * * return a pointer to the last char written (\0) or
- * * NULL if there isn't enough space.
+ * Both t and tm must represent the same time.
+ * return a pointer to the last char written (\0) or
+ * NULL if there isn't enough space.
  */
-char *localdate2str_log(char *dst, struct tm *tm, size_t size)
+char *localdate2str_log(char *dst, time_t t, struct tm *tm, size_t size)
 {
+	const char *gmt_offset;
 	if (size < 27) /* the size is fixed: 26 chars + \0 */
 		return NULL;
+
+	gmt_offset = get_gmt_offset(t, tm);
 
 	dst = utoa_pad((unsigned int)tm->tm_mday, dst, 3); // day
 	*dst++ = '/';
@@ -2253,7 +2564,7 @@ char *localdate2str_log(char *dst, struct tm *tm, size_t size)
 	*dst++ = ':';
 	dst = utoa_pad((unsigned int)tm->tm_sec, dst, 3); // secondes
 	*dst++ = ' ';
-	memcpy(dst, localtimezone, 5); // timezone
+	memcpy(dst, gmt_offset, 5); // Offset from local time to GMT
 	dst += 5;
 	*dst = '\0';
 
@@ -2318,7 +2629,7 @@ char *memprintf(char **out, const char *format, ...)
 		}
 
 		allocated = needed + 1;
-		ret = realloc(ret, allocated);
+		ret = my_realloc2(ret, allocated);
 	} while (ret);
 
 	if (needed < 0) {
@@ -2466,7 +2777,7 @@ char *env_expand(char *in)
 			val_len = value ? strlen(value) : 0;
 		}
 
-		out = realloc(out, out_len + (txt_end - txt_beg) + val_len + 1);
+		out = my_realloc2(out, out_len + (txt_end - txt_beg) + val_len + 1);
 		if (txt_end > txt_beg) {
 			memcpy(out + out_len, txt_beg, txt_end - txt_beg);
 			out_len += txt_end - txt_beg;
@@ -2531,6 +2842,126 @@ const char *strnistr(const char *str1, int len_str1, const char *str2, int len_s
 		}
 	}
 	return NULL;
+}
+
+/* This function read the next valid utf8 char.
+ * <s> is the byte srray to be decode, <len> is its length.
+ * The function returns decoded char encoded like this:
+ * The 4 msb are the return code (UTF8_CODE_*), the 4 lsb
+ * are the length read. The decoded character is stored in <c>.
+ */
+unsigned char utf8_next(const char *s, int len, unsigned int *c)
+{
+	const unsigned char *p = (unsigned char *)s;
+	int dec;
+	unsigned char code = UTF8_CODE_OK;
+
+	if (len < 1)
+		return UTF8_CODE_OK;
+
+	/* Check the type of UTF8 sequence
+	 *
+	 * 0... ....  0x00 <= x <= 0x7f : 1 byte: ascii char
+	 * 10.. ....  0x80 <= x <= 0xbf : invalid sequence
+	 * 110. ....  0xc0 <= x <= 0xdf : 2 bytes
+	 * 1110 ....  0xe0 <= x <= 0xef : 3 bytes
+	 * 1111 0...  0xf0 <= x <= 0xf7 : 4 bytes
+	 * 1111 10..  0xf8 <= x <= 0xfb : 5 bytes
+	 * 1111 110.  0xfc <= x <= 0xfd : 6 bytes
+	 * 1111 111.  0xfe <= x <= 0xff : invalid sequence
+	 */
+	switch (*p) {
+	case 0x00 ... 0x7f:
+		*c = *p;
+		return UTF8_CODE_OK | 1;
+
+	case 0x80 ... 0xbf:
+		*c = *p;
+		return UTF8_CODE_BADSEQ | 1;
+
+	case 0xc0 ... 0xdf:
+		if (len < 2) {
+			*c = *p;
+			return UTF8_CODE_BADSEQ | 1;
+		}
+		*c = *p & 0x1f;
+		dec = 1;
+		break;
+
+	case 0xe0 ... 0xef:
+		if (len < 3) {
+			*c = *p;
+			return UTF8_CODE_BADSEQ | 1;
+		}
+		*c = *p & 0x0f;
+		dec = 2;
+		break;
+
+	case 0xf0 ... 0xf7:
+		if (len < 4) {
+			*c = *p;
+			return UTF8_CODE_BADSEQ | 1;
+		}
+		*c = *p & 0x07;
+		dec = 3;
+		break;
+
+	case 0xf8 ... 0xfb:
+		if (len < 5) {
+			*c = *p;
+			return UTF8_CODE_BADSEQ | 1;
+		}
+		*c = *p & 0x03;
+		dec = 4;
+		break;
+
+	case 0xfc ... 0xfd:
+		if (len < 6) {
+			*c = *p;
+			return UTF8_CODE_BADSEQ | 1;
+		}
+		*c = *p & 0x01;
+		dec = 5;
+		break;
+
+	case 0xfe ... 0xff:
+	default:
+		*c = *p;
+		return UTF8_CODE_BADSEQ | 1;
+	}
+
+	p++;
+
+	while (dec > 0) {
+
+		/* need 0x10 for the 2 first bits */
+		if ( ( *p & 0xc0 ) != 0x80 )
+			return UTF8_CODE_BADSEQ | ((p-(unsigned char *)s)&0xffff);
+
+		/* add data at char */
+		*c = ( *c << 6 ) | ( *p & 0x3f );
+
+		dec--;
+		p++;
+	}
+
+	/* Check ovelong encoding.
+	 * 1 byte  : 5 + 6         : 11 : 0x80    ... 0x7ff
+	 * 2 bytes : 4 + 6 + 6     : 16 : 0x800   ... 0xffff
+	 * 3 bytes : 3 + 6 + 6 + 6 : 21 : 0x10000 ... 0x1fffff
+	 */
+	if ((                 *c <= 0x7f     && (p-(unsigned char *)s) > 1) ||
+	    (*c >= 0x80    && *c <= 0x7ff    && (p-(unsigned char *)s) > 2) ||
+	    (*c >= 0x800   && *c <= 0xffff   && (p-(unsigned char *)s) > 3) ||
+	    (*c >= 0x10000 && *c <= 0x1fffff && (p-(unsigned char *)s) > 4))
+		code |= UTF8_CODE_OVERLONG;
+
+	/* Check invalid UTF8 range. */
+	if ((*c >= 0xd800 && *c <= 0xdfff) ||
+	    (*c >= 0xfffe && *c <= 0xffff))
+		code |= UTF8_CODE_INVRANGE;
+
+	return code | ((p-(unsigned char *)s)&0x0f);
 }
 
 /*
