@@ -28,6 +28,7 @@
 #include <common/regex.h>
 
 #include <types/hdr_idx.h>
+#include <types/sample.h>
 
 /* These are the flags that are found in txn->flags */
 
@@ -36,17 +37,17 @@
 #define TX_CLALLOW	0x00000002	/* a client header matches an allow regex */
 #define TX_SVDENY	0x00000004	/* a server header matches a deny regex */
 #define TX_SVALLOW	0x00000008	/* a server header matches an allow regex */
-#define TX_CLTARPIT	0x00000010	/* the session is tarpitted (anti-dos) */
+#define TX_CLTARPIT	0x00000010	/* the transaction is tarpitted (anti-dos) */
 
 /* transaction flags dedicated to cookies : bits values 0x20 to 0x80 (0-7 shift 5) */
-#define TX_CK_NONE	0x00000000	/* this session had no cookie */
-#define TX_CK_INVALID	0x00000020	/* this session had a cookie which matches no server */
-#define TX_CK_DOWN	0x00000040	/* this session had cookie matching a down server */
-#define TX_CK_VALID	0x00000060	/* this session had cookie matching a valid server */
-#define TX_CK_EXPIRED	0x00000080	/* this session had an expired cookie (idle for too long) */
-#define TX_CK_OLD	0x000000A0	/* this session had too old a cookie (offered too long ago) */
-#define TX_CK_UNUSED	0x000000C0	/* this session had a cookie but it was not used (eg: use-server was preferred) */
-#define TX_CK_MASK	0x000000E0	/* mask to get this session's cookie flags */
+#define TX_CK_NONE	0x00000000	/* this transaction had no cookie */
+#define TX_CK_INVALID	0x00000020	/* this transaction had a cookie which matches no server */
+#define TX_CK_DOWN	0x00000040	/* this transaction had cookie matching a down server */
+#define TX_CK_VALID	0x00000060	/* this transaction had cookie matching a valid server */
+#define TX_CK_EXPIRED	0x00000080	/* this transaction had an expired cookie (idle for too long) */
+#define TX_CK_OLD	0x000000A0	/* this transaction had too old a cookie (offered too long ago) */
+#define TX_CK_UNUSED	0x000000C0	/* this transaction had a cookie but it was not used (eg: use-server was preferred) */
+#define TX_CK_MASK	0x000000E0	/* mask to get this transaction's cookie flags */
 #define TX_CK_SHIFT	5		/* bit shift */
 
 /* response cookie information, bits values 0x100 to 0x700 (0-7 shift 8) */
@@ -217,20 +218,6 @@ enum {
 	PERSIST_TYPE_IGNORE,            /* ignore-persist */
 };
 
-/* Known HTTP methods */
-enum http_meth_t {
-	HTTP_METH_NONE = 0,
-	HTTP_METH_OPTIONS,
-	HTTP_METH_GET,
-	HTTP_METH_HEAD,
-	HTTP_METH_POST,
-	HTTP_METH_PUT,
-	HTTP_METH_DELETE,
-	HTTP_METH_TRACE,
-	HTTP_METH_CONNECT,
-	HTTP_METH_OTHER, /* Must be the last entry */
-} __attribute__((packed));
-
 enum ht_auth_m {
 	HTTP_AUTH_WRONG		= -1,		/* missing or unknown */
 	HTTP_AUTH_UNKNOWN	= 0,
@@ -238,58 +225,10 @@ enum ht_auth_m {
 	HTTP_AUTH_DIGEST,
 } __attribute__((packed));
 
-/* actions for "http-request" */
-enum {
-	HTTP_REQ_ACT_UNKNOWN = 0,
-	HTTP_REQ_ACT_ALLOW,
-	HTTP_REQ_ACT_DENY,
-	HTTP_REQ_ACT_TARPIT,
-	HTTP_REQ_ACT_AUTH,
-	HTTP_REQ_ACT_ADD_HDR,
-	HTTP_REQ_ACT_SET_HDR,
-	HTTP_REQ_ACT_DEL_HDR,
-	HTTP_REQ_ACT_REPLACE_HDR,
-	HTTP_REQ_ACT_REPLACE_VAL,
-	HTTP_REQ_ACT_REDIR,
-	HTTP_REQ_ACT_SET_NICE,
-	HTTP_REQ_ACT_SET_LOGL,
-	HTTP_REQ_ACT_SET_TOS,
-	HTTP_REQ_ACT_SET_MARK,
-	HTTP_REQ_ACT_ADD_ACL,
-	HTTP_REQ_ACT_DEL_ACL,
-	HTTP_REQ_ACT_DEL_MAP,
-	HTTP_REQ_ACT_SET_MAP,
-	HTTP_REQ_ACT_CUSTOM_STOP,
-	HTTP_REQ_ACT_CUSTOM_CONT,
-	HTTP_REQ_ACT_MAX /* must always be last */
-};
-
-/* actions for "http-response" */
-enum {
-	HTTP_RES_ACT_UNKNOWN = 0,
-	HTTP_RES_ACT_ALLOW,
-	HTTP_RES_ACT_DENY,
-	HTTP_RES_ACT_ADD_HDR,
-	HTTP_RES_ACT_REPLACE_HDR,
-	HTTP_RES_ACT_REPLACE_VAL,
-	HTTP_RES_ACT_SET_HDR,
-	HTTP_RES_ACT_DEL_HDR,
-	HTTP_RES_ACT_SET_NICE,
-	HTTP_RES_ACT_SET_LOGL,
-	HTTP_RES_ACT_SET_TOS,
-	HTTP_RES_ACT_SET_MARK,
-	HTTP_RES_ACT_ADD_ACL,
-	HTTP_RES_ACT_DEL_ACL,
-	HTTP_RES_ACT_DEL_MAP,
-	HTTP_RES_ACT_SET_MAP,
-	HTTP_RES_ACT_CUSTOM_STOP,  /* used for module keywords */
-	HTTP_RES_ACT_CUSTOM_CONT,  /* used for module keywords */
-	HTTP_RES_ACT_MAX /* must always be last */
-};
-
 /* final results for http-request rules */
 enum rule_result {
 	HTTP_RULE_RES_CONT = 0,  /* nothing special, continue rules evaluation */
+	HTTP_RULE_RES_YIELD,     /* call me later because some data is missing. */
 	HTTP_RULE_RES_STOP,      /* stopped processing on an accept */
 	HTTP_RULE_RES_DENY,      /* deny (or tarpit if TX_CLTARPIT)  */
 	HTTP_RULE_RES_ABRT,      /* abort request, msg already sent (eg: auth) */
@@ -304,7 +243,9 @@ enum {
 	HTTP_ERR_200 = 0,
 	HTTP_ERR_400,
 	HTTP_ERR_403,
+	HTTP_ERR_405,
 	HTTP_ERR_408,
+	HTTP_ERR_429,
 	HTTP_ERR_500,
 	HTTP_ERR_502,
 	HTTP_ERR_503,
@@ -398,7 +339,6 @@ struct http_msg {
 	} sl;                                  /* start line */
 	unsigned long long chunk_len;          /* cache for last chunk size or content-length header value */
 	unsigned long long body_len;           /* total known length of the body, excluding encoding */
-	char **cap;                            /* array of captured headers (may be NULL) */
 };
 
 struct http_auth_data {
@@ -410,61 +350,7 @@ struct http_auth_data {
 
 struct proxy;
 struct http_txn;
-struct session;
-
-struct http_req_rule {
-	struct list list;
-	struct acl_cond *cond;                 /* acl condition to meet */
-	unsigned int action;                   /* HTTP_REQ_* */
-	int (*action_ptr)(struct http_req_rule *rule, struct proxy *px, struct session *s, struct http_txn *http_txn);  /* ptr to custom action */
-	union {
-		struct {
-			char *realm;
-		} auth;                        /* arg used by "auth" */
-		struct {
-			char *name;            /* header name */
-			int name_len;          /* header name's length */
-			struct list fmt;       /* log-format compatible expression */
-			struct my_regex re;    /* used by replace-header and replace-value */
-		} hdr_add;                     /* args used by "add-header" and "set-header" */
-		struct redirect_rule *redir;   /* redirect rule or "http-request redirect" */
-		int nice;                      /* nice value for HTTP_REQ_ACT_SET_NICE */
-		int loglevel;                  /* log-level value for HTTP_REQ_ACT_SET_LOGL */
-		int tos;                       /* tos value for HTTP_REQ_ACT_SET_TOS */
-		int mark;                      /* nfmark value for HTTP_REQ_ACT_SET_MARK */
-		void *data;                    /* generic pointer for module or external rule */
-		struct {
-			char *ref;             /* MAP or ACL file name to update */
-			struct list key;       /* pattern to retrieve MAP or ACL key */
-			struct list value;     /* pattern to retrieve MAP value */
-		} map;
-	} arg;                                 /* arguments used by some actions */
-};
-
-struct http_res_rule {
-	struct list list;
-	struct acl_cond *cond;                 /* acl condition to meet */
-	unsigned int action;                   /* HTTP_RES_* */
-	int (*action_ptr)(struct http_res_rule *rule, struct proxy *px, struct session *s, struct http_txn *http_txn);  /* ptr to custom action */
-	union {
-		struct {
-			char *name;            /* header name */
-			int name_len;          /* header name's length */
-			struct list fmt;       /* log-format compatible expression */
-			struct my_regex re;    /* used by replace-header and replace-value */
-		} hdr_add;                     /* args used by "add-header" and "set-header" */
-		int nice;                      /* nice value for HTTP_RES_ACT_SET_NICE */
-		int loglevel;                  /* log-level value for HTTP_RES_ACT_SET_LOGL */
-		int tos;                       /* tos value for HTTP_RES_ACT_SET_TOS */
-		int mark;                      /* nfmark value for HTTP_RES_ACT_SET_MARK */
-		void *data;                    /* generic pointer for module or external rule */
-		struct {
-			char *ref;             /* MAP or ACL file name to update */
-			struct list key;       /* pattern to retrieve MAP or ACL key */
-			struct list value;     /* pattern to retrieve MAP value */
-		} map;
-	} arg;                                 /* arguments used by some actions */
-};
+struct stream;
 
 /* This is an HTTP transaction. It contains both a request message and a
  * response message (which can be empty).
@@ -481,7 +367,6 @@ struct http_txn {
 	char *uri;                      /* first line if log needed, NULL otherwise */
 	char *cli_cookie;               /* cookie presented by the client, in capture mode */
 	char *srv_cookie;               /* cookie presented by the server, in capture mode */
-	char *sessid;                   /* the appsession id, if found in the request or in the response */
 	int cookie_first_date;          /* if non-zero, first date the expirable cookie was set/seen */
 	int cookie_last_date;           /* if non-zero, last date the expirable cookie was set/seen */
 
@@ -511,32 +396,12 @@ struct http_method_name {
 	int len;
 };
 
-struct http_req_action_kw {
-       const char *kw;
-       int (*parse)(const char **args, int *cur_arg, struct proxy *px, struct http_req_rule *rule, char **err);
-};
-
-struct http_res_action_kw {
-       const char *kw;
-       int (*parse)(const char **args, int *cur_arg, struct proxy *px, struct http_res_rule *rule, char **err);
-};
-
-struct http_req_action_kw_list {
-       const char *scope;
-       struct list list;
-       struct http_req_action_kw kw[VAR_ARRAY];
-};
-
-struct http_res_action_kw_list {
-       const char *scope;
-       struct list list;
-       struct http_res_action_kw kw[VAR_ARRAY];
-};
-
-extern struct http_req_action_kw_list http_req_keywords;
-extern struct http_res_action_kw_list http_res_keywords;
+extern struct action_kw_list http_req_keywords;
+extern struct action_kw_list http_res_keywords;
 
 extern const struct http_method_name http_known_methods[HTTP_METH_OTHER];
+
+extern struct pool_head *pool2_http_txn;
 
 #endif /* _TYPES_PROTO_HTTP_H */
 

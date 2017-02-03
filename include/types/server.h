@@ -73,18 +73,31 @@ enum srv_state {
  *   state_str = (state & MAINT) ? "MAINT" : (state & DRAIN) : "DRAIN" : "READY"
  */
 enum srv_admin {
-	SRV_ADMF_FMAINT    = 0x1,        /* the server was explicitly forced into maintenance */
-	SRV_ADMF_IMAINT    = 0x2,        /* the server has inherited the maintenance status from a tracked server */
-	SRV_ADMF_MAINT     = 0x3,        /* mask to check if any maintenance flag is present */
-	SRV_ADMF_FDRAIN    = 0x4,        /* the server was explicitly forced into drain state */
-	SRV_ADMF_IDRAIN    = 0x8,        /* the server has inherited the drain status from a tracked server */
-	SRV_ADMF_DRAIN     = 0xC,        /* mask to check if any drain flag is present */
+	SRV_ADMF_FMAINT    = 0x01,        /* the server was explicitly forced into maintenance */
+	SRV_ADMF_IMAINT    = 0x02,        /* the server has inherited the maintenance status from a tracked server */
+	SRV_ADMF_MAINT     = 0x03,        /* mask to check if any maintenance flag is present */
+	SRV_ADMF_CMAINT    = 0x04,        /* the server is in maintenance because of the configuration */
+	SRV_ADMF_FDRAIN    = 0x08,        /* the server was explicitly forced into drain state */
+	SRV_ADMF_IDRAIN    = 0x10,        /* the server has inherited the drain status from a tracked server */
+	SRV_ADMF_DRAIN     = 0x18,        /* mask to check if any drain flag is present */
 };
+
+/* server-state-file version */
+#define SRV_STATE_FILE_VERSION 1
+#define SRV_STATE_FILE_VERSION_MIN 1
+#define SRV_STATE_FILE_VERSION_MAX 1
+#define SRV_STATE_FILE_FIELD_NAMES "be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state srv_agent_state bk_f_forced_id srv_f_forced_id"
+#define SRV_STATE_FILE_MAX_FIELDS 18
+#define SRV_STATE_FILE_NB_FIELDS_VERSION_1 18
+#define SRV_STATE_LINE_MAXLEN 512
+
 
 /* server flags */
 #define SRV_F_BACKUP       0x0001        /* this server is a backup server */
 #define SRV_F_MAPPORTS     0x0002        /* this server uses mapped ports */
 #define SRV_F_NON_STICK    0x0004        /* never add connections allocated to this server to a stick table */
+#define SRV_F_USE_NS_FROM_PP 0x0008      /* use namespace associated with connection if present */
+#define SRV_F_FORCED_ID    0x0010        /* server's ID was forced in the configuration */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1          0x0001        /* proxy protocol version 1 */
@@ -121,7 +134,16 @@ enum srv_admin {
 #define SRV_SSL_O_USE_TLSV12   0x0080 /* force TLSv1.2 */
 /* 0x00F0 reserved for 'force' protocol version options */
 #define SRV_SSL_O_NO_TLS_TICKETS 0x0100 /* disable session resumption tickets */
+#define SRV_SSL_O_NO_REUSE     0x200  /* disable session reuse */
 #endif
+
+struct pid_list {
+	struct list list;
+	pid_t pid;
+	struct task *t;
+	int status;
+	int exited;
+};
 
 /* A tree occurrence is a descriptor of a place in a tree, with a pointer back
  * to the server itself.
@@ -155,6 +177,9 @@ struct server {
 
 	struct list pendconns;			/* pending connections */
 	struct list actconns;			/* active connections */
+	struct list priv_conns;			/* private idle connections attached to stream interfaces */
+	struct list idle_conns;			/* sharable idle connections attached or not to a stream interface */
+	struct list safe_conns;			/* safe idle connections attached to stream interfaces, shared */
 	struct task *warmup;                    /* the task dedicated to the warmup when slowstart is set */
 
 	struct conn_src conn_src;               /* connection source settings */
@@ -183,22 +208,23 @@ struct server {
 	unsigned lb_nodes_now;                  /* number of lb_nodes placed in the tree (C-HASH) */
 	struct tree_occ *lb_nodes;              /* lb_nodes_tot * struct tree_occ */
 
+	const struct netns_entry *netns;        /* contains network namespace name or NULL. Network namespace comes from configuration */
 	/* warning, these structs are huge, keep them at the bottom */
 	struct sockaddr_storage addr;		/* the address to connect to */
-	struct protocol *proto;	                /* server address protocol */
 	struct xprt_ops *xprt;                  /* transport-layer operations */
 	unsigned down_time;			/* total time the server was down */
 	time_t last_change;			/* last time, when the state was changed */
 
 	int puid;				/* proxy-unique server ID, used for SNMP, and "first" LB algo */
-
-	struct {                                /* configuration  used by health-check and agent-check */
-		struct protocol *proto;	        /* server address protocol for health checks */
-		struct sockaddr_storage addr;   /* the address to check, if different from <addr> */
-	} check_common;
+	int tcp_ut;                             /* for TCP, user timeout */
 
 	struct check check;                     /* health-check specific configuration */
 	struct check agent;                     /* agent specific configuration */
+
+	char *resolvers_id;			/* resolvers section used by this server */
+	char *hostname;				/* server hostname */
+	struct dns_resolution *resolution;	/* server name resolution */
+	int resolver_family_priority;		/* which IP family should the resolver use when both are returned */
 
 #ifdef USE_OPENSSL
 	int use_ssl;				/* ssl enabled */
@@ -212,6 +238,7 @@ struct server {
 		char *ca_file;			/* CAfile to use on verify */
 		char *crl_file;			/* CRLfile to use on verify */
 		char *client_crt;		/* client certificate to send */
+		struct sample_expr *sni;        /* sample expression for SNI */
 	} ssl_ctx;
 #endif
 	struct {

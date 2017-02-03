@@ -26,6 +26,7 @@
 #include <common/hash.h>
 #include <common/ticks.h>
 #include <common/time.h>
+#include <common/namespace.h>
 
 #include <types/global.h>
 
@@ -49,10 +50,14 @@
 #include <proto/queue.h>
 #include <proto/sample.h>
 #include <proto/server.h>
-#include <proto/session.h>
+#include <proto/stream.h>
 #include <proto/raw_sock.h>
 #include <proto/stream_interface.h>
 #include <proto/task.h>
+
+#ifdef USE_OPENSSL
+#include <proto/ssl_sock.h>
+#endif /* USE_OPENSSL */
 
 int be_lastsession(const struct proxy *be)
 {
@@ -73,6 +78,9 @@ static unsigned int gen_hash(const struct proxy* px, const char* key, unsigned l
 		break;
 	case BE_LB_HFCN_WT6:
 		hash = hash_wt6(key, len);
+		break;
+	case BE_LB_HFCN_CRC32:
+		hash = hash_crc32(key, len);
 		break;
 	case BE_LB_HFCN_SDBM:
 		/* this is the default hash function */
@@ -293,11 +301,11 @@ struct server *get_server_ph(struct proxy *px, const char *uri, int uri_len)
 /*
  * this does the same as the previous server_ph, but check the body contents
  */
-struct server *get_server_ph_post(struct session *s)
+struct server *get_server_ph_post(struct stream *s)
 {
 	unsigned int hash = 0;
-	struct http_txn *txn  = &s->txn;
-	struct channel   *req = s->req;
+	struct http_txn *txn  = s->txn;
+	struct channel  *req  = &s->req;
 	struct http_msg *msg  = &txn->req;
 	struct proxy    *px   = s->be;
 	unsigned int     plen = px->url_param_len;
@@ -374,10 +382,10 @@ struct server *get_server_ph_post(struct session *s)
  * is returned. If any server is found, it will be returned. If no valid server
  * is found, NULL is returned.
  */
-struct server *get_server_hh(struct session *s)
+struct server *get_server_hh(struct stream *s)
 {
 	unsigned int hash = 0;
-	struct http_txn *txn  = &s->txn;
+	struct http_txn *txn  = s->txn;
 	struct proxy    *px   = s->be;
 	unsigned int     plen = px->hh_len;
 	unsigned long    len;
@@ -392,7 +400,7 @@ struct server *get_server_hh(struct session *s)
 	ctx.idx = 0;
 
 	/* if the message is chunked, we skip the chunk size, but use the value as len */
-	http_find_header2(px->hh_name, plen, b_ptr(s->req->buf, -http_hdr_rewind(&txn->req)), &txn->hdr_idx, &ctx);
+	http_find_header2(px->hh_name, plen, b_ptr(s->req.buf, -http_hdr_rewind(&txn->req)), &txn->hdr_idx, &ctx);
 
 	/* if the header is not found or empty, let's fallback to round robin */
 	if (!ctx.idx || !ctx.vlen)
@@ -450,7 +458,7 @@ struct server *get_server_hh(struct session *s)
 }
 
 /* RDP Cookie HASH.  */
-struct server *get_server_rch(struct session *s)
+struct server *get_server_rch(struct stream *s)
 {
 	unsigned int hash = 0;
 	struct proxy    *px   = s->be;
@@ -465,12 +473,12 @@ struct server *get_server_rch(struct session *s)
 
 	memset(&smp, 0, sizeof(smp));
 
-	b_rew(s->req->buf, rewind = s->req->buf->o);
+	b_rew(s->req.buf, rewind = s->req.buf->o);
 
 	ret = fetch_rdp_cookie_name(s, &smp, px->hh_name, px->hh_len);
-	len = smp.data.str.len;
+	len = smp.data.u.str.len;
 
-	b_adv(s->req->buf, rewind);
+	b_adv(s->req.buf, rewind);
 
 	if (ret == 0 || (smp.flags & SMP_F_MAY_CHANGE) || len == 0)
 		return NULL;
@@ -482,7 +490,7 @@ struct server *get_server_rch(struct session *s)
 	/* Found a the hh_name in the headers.
 	 * we will compute the hash based on this value ctx.val.
 	 */
-	hash = gen_hash(px, smp.data.str.str, len);
+	hash = gen_hash(px, smp.data.u.str.str, len);
 
 	if ((px->lbprm.algo & BE_LB_HASH_MOD) == BE_LB_HMOD_AVAL)
 		hash = full_hash(hash);
@@ -494,31 +502,31 @@ struct server *get_server_rch(struct session *s)
 }
  
 /*
- * This function applies the load-balancing algorithm to the session, as
- * defined by the backend it is assigned to. The session is then marked as
+ * This function applies the load-balancing algorithm to the stream, as
+ * defined by the backend it is assigned to. The stream is then marked as
  * 'assigned'.
  *
- * This function MAY NOT be called with SN_ASSIGNED already set. If the session
+ * This function MAY NOT be called with SF_ASSIGNED already set. If the stream
  * had a server previously assigned, it is rebalanced, trying to avoid the same
  * server, which should still be present in target_srv(&s->target) before the call.
  * The function tries to keep the original connection slot if it reconnects to
  * the same server, otherwise it releases it and tries to offer it.
  *
- * It is illegal to call this function with a session in a queue.
+ * It is illegal to call this function with a stream in a queue.
  *
  * It may return :
  *   SRV_STATUS_OK       if everything is OK. ->srv and ->target are assigned.
- *   SRV_STATUS_NOSRV    if no server is available. Session is not ASSIGNED
- *   SRV_STATUS_FULL     if all servers are saturated. Session is not ASSIGNED
+ *   SRV_STATUS_NOSRV    if no server is available. Stream is not ASSIGNED
+ *   SRV_STATUS_FULL     if all servers are saturated. Stream is not ASSIGNED
  *   SRV_STATUS_INTERNAL for other unrecoverable errors.
  *
- * Upon successful return, the session flag SN_ASSIGNED is set to indicate that
+ * Upon successful return, the stream flag SF_ASSIGNED is set to indicate that
  * it does not need to be called anymore. This means that target_srv(&s->target)
  * can be trusted in balance and direct modes.
  *
  */
 
-int assign_server(struct session *s)
+int assign_server(struct stream *s)
 {
 	struct connection *conn;
 	struct server *conn_slot;
@@ -528,7 +536,7 @@ int assign_server(struct session *s)
 	DPRINTF(stderr,"assign_server : s=%p\n",s);
 
 	err = SRV_STATUS_INTERNAL;
-	if (unlikely(s->pend_pos || s->flags & SN_ASSIGNED))
+	if (unlikely(s->pend_pos || s->flags & SF_ASSIGNED))
 		goto out_err;
 
 	prev_srv  = objt_server(s->target);
@@ -547,18 +555,18 @@ int assign_server(struct session *s)
 
 	srv = NULL;
 	s->target = NULL;
-	conn = objt_conn(s->req->cons->end);
+	conn = objt_conn(s->si[1].end);
 
 	if (conn &&
 	    (conn->flags & CO_FL_CONNECTED) &&
 	    objt_server(conn->target) && __objt_server(conn->target)->proxy == s->be &&
-	    ((s->txn.flags & TX_PREFER_LAST) ||
+	    ((s->txn && s->txn->flags & TX_PREFER_LAST) ||
 	     ((s->be->options & PR_O_PREF_LAST) &&
 	      (!s->be->max_ka_queue ||
 	       server_has_room(__objt_server(conn->target)) ||
 	       (__objt_server(conn->target)->nbpend + 1) < s->be->max_ka_queue))) &&
 	    srv_is_usable(__objt_server(conn->target))) {
-		/* This session was relying on a server in a previous request
+		/* This stream was relying on a server in a previous request
 		 * and the proxy has "option prefer-last-server" set, so
 		 * let's try to reuse the same server.
 		 */
@@ -606,7 +614,7 @@ int assign_server(struct session *s)
 
 			switch (s->be->lbprm.algo & BE_LB_PARM) {
 			case BE_LB_HASH_SRC:
-				conn = objt_conn(s->req->prod->end);
+				conn = objt_conn(strm_orig(s));
 				if (conn && conn->addr.from.ss_family == AF_INET) {
 					srv = get_server_sh(s->be,
 							    (void *)&((struct sockaddr_in *)&conn->addr.from)->sin_addr,
@@ -626,29 +634,29 @@ int assign_server(struct session *s)
 
 			case BE_LB_HASH_URI:
 				/* URI hashing */
-				if (s->txn.req.msg_state < HTTP_MSG_BODY)
+				if (!s->txn || s->txn->req.msg_state < HTTP_MSG_BODY)
 					break;
 				srv = get_server_uh(s->be,
-						    b_ptr(s->req->buf, -http_uri_rewind(&s->txn.req)),
-						    s->txn.req.sl.rq.u_l);
+						    b_ptr(s->req.buf, -http_uri_rewind(&s->txn->req)),
+						    s->txn->req.sl.rq.u_l);
 				break;
 
 			case BE_LB_HASH_PRM:
 				/* URL Parameter hashing */
-				if (s->txn.req.msg_state < HTTP_MSG_BODY)
+				if (!s->txn || s->txn->req.msg_state < HTTP_MSG_BODY)
 					break;
 
 				srv = get_server_ph(s->be,
-						    b_ptr(s->req->buf, -http_uri_rewind(&s->txn.req)),
-						    s->txn.req.sl.rq.u_l);
+						    b_ptr(s->req.buf, -http_uri_rewind(&s->txn->req)),
+						    s->txn->req.sl.rq.u_l);
 
-				if (!srv && s->txn.meth == HTTP_METH_POST)
+				if (!srv && s->txn->meth == HTTP_METH_POST)
 					srv = get_server_ph_post(s);
 				break;
 
 			case BE_LB_HASH_HDR:
 				/* Header Parameter hashing */
-				if (s->txn.req.msg_state < HTTP_MSG_BODY)
+				if (!s->txn || s->txn->req.msg_state < HTTP_MSG_BODY)
 					break;
 				srv = get_server_hh(s);
 				break;
@@ -697,7 +705,7 @@ int assign_server(struct session *s)
 		s->target = &s->be->obj_type;
 	}
 	else if ((s->be->options & PR_O_HTTP_PROXY) &&
-		 (conn = objt_conn(s->req->cons->end)) &&
+		 (conn = objt_conn(s->si[1].end)) &&
 		 is_addr(&conn->addr.to)) {
 		/* in proxy mode, we need a valid destination address */
 		s->target = &s->be->obj_type;
@@ -707,7 +715,7 @@ int assign_server(struct session *s)
 		goto out;
 	}
 
-	s->flags |= SN_ASSIGNED;
+	s->flags |= SF_ASSIGNED;
 	err = SRV_STATUS_OK;
  out:
 
@@ -727,9 +735,8 @@ int assign_server(struct session *s)
 	return err;
 }
 
-
 /*
- * This function assigns a server address to a session, and sets SN_ADDR_SET.
+ * This function assigns a server address to a stream, and sets SF_ADDR_SET.
  * The address is taken from the currently assigned server, or from the
  * dispatch or transparent address.
  *
@@ -737,25 +744,25 @@ int assign_server(struct session *s)
  *   SRV_STATUS_OK       if everything is OK.
  *   SRV_STATUS_INTERNAL for other unrecoverable errors.
  *
- * Upon successful return, the session flag SN_ADDR_SET is set. This flag is
+ * Upon successful return, the stream flag SF_ADDR_SET is set. This flag is
  * not cleared, so it's to the caller to clear it if required.
  *
  * The caller is responsible for having already assigned a connection
  * to si->end.
  *
  */
-int assign_server_address(struct session *s)
+int assign_server_address(struct stream *s)
 {
-	struct connection *cli_conn = objt_conn(s->req->prod->end);
-	struct connection *srv_conn = objt_conn(s->req->cons->end);
+	struct connection *cli_conn = objt_conn(strm_orig(s));
+	struct connection *srv_conn = objt_conn(s->si[1].end);
 
 #ifdef DEBUG_FULL
 	fprintf(stderr,"assign_server_address : s=%p\n",s);
 #endif
 
-	if ((s->flags & SN_DIRECT) || (s->be->lbprm.algo & BE_LB_KIND)) {
-		/* A server is necessarily known for this session */
-		if (!(s->flags & SN_ASSIGNED))
+	if ((s->flags & SF_DIRECT) || (s->be->lbprm.algo & BE_LB_KIND)) {
+		/* A server is necessarily known for this stream */
+		if (!(s->flags & SF_ASSIGNED))
 			return SRV_STATUS_INTERNAL;
 
 		srv_conn->addr.to = objt_server(s->target)->addr;
@@ -810,18 +817,20 @@ int assign_server_address(struct session *s)
 		return SRV_STATUS_INTERNAL;
 	}
 
-	s->flags |= SN_ADDR_SET;
+	/* Copy network namespace from client connection */
+	srv_conn->proxy_netns = cli_conn ? cli_conn->proxy_netns : NULL;
+
+	s->flags |= SF_ADDR_SET;
 	return SRV_STATUS_OK;
 }
 
-
-/* This function assigns a server to session <s> if required, and can add the
+/* This function assigns a server to stream <s> if required, and can add the
  * connection to either the assigned server's queue or to the proxy's queue.
- * If ->srv_conn is set, the session is first released from the server.
- * It may also be called with SN_DIRECT and/or SN_ASSIGNED though. It will
+ * If ->srv_conn is set, the stream is first released from the server.
+ * It may also be called with SF_DIRECT and/or SF_ASSIGNED though. It will
  * be called before any connection and after any retry or redispatch occurs.
  *
- * It is not allowed to call this function with a session in a queue.
+ * It is not allowed to call this function with a stream in a queue.
  *
  * Returns :
  *
@@ -834,7 +843,7 @@ int assign_server_address(struct session *s)
  *   SRV_STATUS_INTERNAL for other unrecoverable errors.
  *
  */
-int assign_server_and_queue(struct session *s)
+int assign_server_and_queue(struct stream *s)
 {
 	struct pendconn *p;
 	struct server *srv;
@@ -844,26 +853,26 @@ int assign_server_and_queue(struct session *s)
 		return SRV_STATUS_INTERNAL;
 
 	err = SRV_STATUS_OK;
-	if (!(s->flags & SN_ASSIGNED)) {
+	if (!(s->flags & SF_ASSIGNED)) {
 		struct server *prev_srv = objt_server(s->target);
 
 		err = assign_server(s);
 		if (prev_srv) {
-			/* This session was previously assigned to a server. We have to
-			 * update the session's and the server's stats :
+			/* This stream was previously assigned to a server. We have to
+			 * update the stream's and the server's stats :
 			 *  - if the server changed :
 			 *    - set TX_CK_DOWN if txn.flags was TX_CK_VALID
-			 *    - set SN_REDISP if it was successfully redispatched
+			 *    - set SF_REDISP if it was successfully redispatched
 			 *    - increment srv->redispatches and be->redispatches
 			 *  - if the server remained the same : update retries.
 			 */
 
 			if (prev_srv != objt_server(s->target)) {
-				if ((s->txn.flags & TX_CK_MASK) == TX_CK_VALID) {
-					s->txn.flags &= ~TX_CK_MASK;
-					s->txn.flags |= TX_CK_DOWN;
+				if (s->txn && (s->txn->flags & TX_CK_MASK) == TX_CK_VALID) {
+					s->txn->flags &= ~TX_CK_MASK;
+					s->txn->flags |= TX_CK_DOWN;
 				}
-				s->flags |= SN_REDISP;
+				s->flags |= SF_REDISP;
 				prev_srv->counters.redispatches++;
 				s->be->be_counters.redispatches++;
 			} else {
@@ -875,7 +884,7 @@ int assign_server_and_queue(struct session *s)
 
 	switch (err) {
 	case SRV_STATUS_OK:
-		/* we have SN_ASSIGNED set */
+		/* we have SF_ASSIGNED set */
 		srv = objt_server(s->target);
 		if (!srv)
 			return SRV_STATUS_OK;   /* dispatch or proxy mode */
@@ -884,11 +893,11 @@ int assign_server_and_queue(struct session *s)
 		if (s->srv_conn == srv)
 			return SRV_STATUS_OK;
 
-		/* OK, this session already has an assigned server, but no
+		/* OK, this stream already has an assigned server, but no
 		 * connection slot yet. Either it is a redispatch, or it was
 		 * assigned from persistence information (direct mode).
 		 */
-		if ((s->flags & SN_REDIRECTABLE) && srv->rdr_len) {
+		if ((s->flags & SF_REDIRECTABLE) && srv->rdr_len) {
 			/* server scheduled for redirection, and already assigned. We
 			 * don't want to go further nor check the queue.
 			 */
@@ -896,7 +905,7 @@ int assign_server_and_queue(struct session *s)
 			return SRV_STATUS_OK;
 		}
 
-		/* We might have to queue this session if the assigned server is full.
+		/* We might have to queue this stream if the assigned server is full.
 		 * We know we have to queue it into the server's queue, so if a maxqueue
 		 * is set on the server, we must also check that the server's queue is
 		 * not full, in which case we have to return FULL.
@@ -919,7 +928,7 @@ int assign_server_and_queue(struct session *s)
 		return SRV_STATUS_OK;
 
 	case SRV_STATUS_FULL:
-		/* queue this session into the proxy's queue */
+		/* queue this stream into the proxy's queue */
 		p = pendconn_add(s);
 		if (p)
 			return SRV_STATUS_QUEUED;
@@ -939,16 +948,16 @@ int assign_server_and_queue(struct session *s)
 
 /* If an explicit source binding is specified on the server and/or backend, and
  * this source makes use of the transparent proxy, then it is extracted now and
- * assigned to the session's pending connection. This function assumes that an
- * outgoing connection has already been assigned to s->req->cons->end.
+ * assigned to the stream's pending connection. This function assumes that an
+ * outgoing connection has already been assigned to s->si[1].end.
  */
-static void assign_tproxy_address(struct session *s)
+static void assign_tproxy_address(struct stream *s)
 {
-#if defined(CONFIG_HAP_CTTPROXY) || defined(CONFIG_HAP_TRANSPARENT)
+#if defined(CONFIG_HAP_TRANSPARENT)
 	struct server *srv = objt_server(s->target);
 	struct conn_src *src;
 	struct connection *cli_conn;
-	struct connection *srv_conn = objt_conn(s->req->cons->end);
+	struct connection *srv_conn = objt_conn(s->si[1].end);
 
 	if (srv && srv->conn_src.opts & CO_SRC_BIND)
 		src = &srv->conn_src;
@@ -964,14 +973,14 @@ static void assign_tproxy_address(struct session *s)
 	case CO_SRC_TPROXY_CLI:
 	case CO_SRC_TPROXY_CIP:
 		/* FIXME: what can we do if the client connects in IPv6 or unix socket ? */
-		cli_conn = objt_conn(s->req->prod->end);
+		cli_conn = objt_conn(strm_orig(s));
 		if (cli_conn)
 			srv_conn->addr.from = cli_conn->addr.from;
 		else
 			memset(&srv_conn->addr.from, 0, sizeof(srv_conn->addr.from));
 		break;
 	case CO_SRC_TPROXY_DYN:
-		if (src->bind_hdr_occ) {
+		if (src->bind_hdr_occ && s->txn) {
 			char *vptr;
 			int vlen;
 			int rewind;
@@ -981,13 +990,13 @@ static void assign_tproxy_address(struct session *s)
 			((struct sockaddr_in *)&srv_conn->addr.from)->sin_port = 0;
 			((struct sockaddr_in *)&srv_conn->addr.from)->sin_addr.s_addr = 0;
 
-			b_rew(s->req->buf, rewind = http_hdr_rewind(&s->txn.req));
-			if (http_get_hdr(&s->txn.req, src->bind_hdr_name, src->bind_hdr_len,
-					 &s->txn.hdr_idx, src->bind_hdr_occ, NULL, &vptr, &vlen)) {
+			b_rew(s->req.buf, rewind = http_hdr_rewind(&s->txn->req));
+			if (http_get_hdr(&s->txn->req, src->bind_hdr_name, src->bind_hdr_len,
+					 &s->txn->hdr_idx, src->bind_hdr_occ, NULL, &vptr, &vlen)) {
 				((struct sockaddr_in *)&srv_conn->addr.from)->sin_addr.s_addr =
 					htonl(inetaddr_host_lim(vptr, vptr + vlen));
 			}
-			b_adv(s->req->buf, rewind);
+			b_adv(s->req.buf, rewind);
 		}
 		break;
 	default:
@@ -998,31 +1007,103 @@ static void assign_tproxy_address(struct session *s)
 
 
 /*
- * This function initiates a connection to the server assigned to this session
- * (s->target, s->req->cons->addr.to). It will assign a server if none
+ * This function initiates a connection to the server assigned to this stream
+ * (s->target, s->si[1].addr.to). It will assign a server if none
  * is assigned yet.
  * It can return one of :
- *  - SN_ERR_NONE if everything's OK
- *  - SN_ERR_SRVTO if there are no more servers
- *  - SN_ERR_SRVCL if the connection was refused by the server
- *  - SN_ERR_PRXCOND if the connection has been limited by the proxy (maxconn)
- *  - SN_ERR_RESOURCE if a system resource is lacking (eg: fd limits, ports, ...)
- *  - SN_ERR_INTERNAL for any other purely internal errors
- * Additionnally, in the case of SN_ERR_RESOURCE, an emergency log will be emitted.
+ *  - SF_ERR_NONE if everything's OK
+ *  - SF_ERR_SRVTO if there are no more servers
+ *  - SF_ERR_SRVCL if the connection was refused by the server
+ *  - SF_ERR_PRXCOND if the connection has been limited by the proxy (maxconn)
+ *  - SF_ERR_RESOURCE if a system resource is lacking (eg: fd limits, ports, ...)
+ *  - SF_ERR_INTERNAL for any other purely internal errors
+ * Additionnally, in the case of SF_ERR_RESOURCE, an emergency log will be emitted.
  * The server-facing stream interface is expected to hold a pre-allocated connection
- * in s->req->cons->conn.
+ * in s->si[1].conn.
  */
-int connect_server(struct session *s)
+int connect_server(struct stream *s)
 {
 	struct connection *cli_conn;
 	struct connection *srv_conn;
+	struct connection *old_conn;
 	struct server *srv;
 	int reuse = 0;
 	int err;
 
-	srv_conn = objt_conn(s->req->cons->end);
+	srv = objt_server(s->target);
+	srv_conn = objt_conn(s->si[1].end);
 	if (srv_conn)
 		reuse = s->target == srv_conn->target;
+
+	if (srv && !reuse) {
+		old_conn = srv_conn;
+		if (old_conn) {
+			srv_conn = NULL;
+			old_conn->owner = NULL;
+			si_detach_endpoint(&s->si[1]);
+			/* note: if the connection was in a server's idle
+			 * queue, it doesn't get dequeued.
+			 */
+		}
+
+		/* Below we pick connections from the safe or idle lists based
+		 * on the strategy, the fact that this is a first or second
+		 * (retryable) request, with the indicated priority (1 or 2) :
+		 *
+		 *          SAFE                 AGGR                ALWS
+		 *
+		 *      +-----+-----+        +-----+-----+       +-----+-----+
+		 *   req| 1st | 2nd |     req| 1st | 2nd |    req| 1st | 2nd |
+		 *  ----+-----+-----+    ----+-----+-----+   ----+-----+-----+
+		 *  safe|  -  |  2  |    safe|  1  |  2  |   safe|  1  |  2  |
+		 *  ----+-----+-----+    ----+-----+-----+   ----+-----+-----+
+		 *  idle|  -  |  1  |    idle|  -  |  1  |   idle|  2  |  1  |
+		 *  ----+-----+-----+    ----+-----+-----+   ----+-----+-----+
+		 */
+
+		if (!LIST_ISEMPTY(&srv->idle_conns) &&
+		    ((s->be->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR &&
+		     s->txn && (s->txn->flags & TX_NOT_FIRST))) {
+			srv_conn = LIST_ELEM(srv->idle_conns.n, struct connection *, list);
+		}
+		else if (!LIST_ISEMPTY(&srv->safe_conns) &&
+			 ((s->txn && (s->txn->flags & TX_NOT_FIRST)) ||
+			  (s->be->options & PR_O_REUSE_MASK) >= PR_O_REUSE_AGGR)) {
+			srv_conn = LIST_ELEM(srv->safe_conns.n, struct connection *, list);
+		}
+		else if (!LIST_ISEMPTY(&srv->idle_conns) &&
+			 (s->be->options & PR_O_REUSE_MASK) == PR_O_REUSE_ALWS) {
+			srv_conn = LIST_ELEM(srv->idle_conns.n, struct connection *, list);
+		}
+
+		/* If we've picked a connection from the pool, we now have to
+		 * detach it. We may have to get rid of the previous idle
+		 * connection we had, so for this we try to swap it with the
+		 * other owner's. That way it may remain alive for others to
+		 * pick.
+		 */
+		if (srv_conn) {
+			LIST_DEL(&srv_conn->list);
+			LIST_INIT(&srv_conn->list);
+
+			if (srv_conn->owner) {
+				si_detach_endpoint(srv_conn->owner);
+				if (old_conn && !(old_conn->flags & CO_FL_PRIVATE)) {
+					si_attach_conn(srv_conn->owner, old_conn);
+					si_idle_conn(srv_conn->owner, NULL);
+				}
+			}
+			si_attach_conn(&s->si[1], srv_conn);
+			reuse = 1;
+		}
+
+		/* we may have to release our connection if we couldn't swap it */
+		if (old_conn && !old_conn->owner) {
+			LIST_DEL(&old_conn->list);
+			conn_force_close(old_conn);
+			conn_free(old_conn);
+		}
+	}
 
 	if (reuse) {
 		/* Disable connection reuse if a dynamic source is used.
@@ -1030,7 +1111,6 @@ int connect_server(struct session *s)
 		 * we don't need to disable connection reuse on no-idempotent
 		 * requests nor when PROXY protocol is used.
 		 */
-		srv = objt_server(s->target);
 		if (srv && srv->conn_src.opts & CO_SRC_BIND) {
 			if ((srv->conn_src.opts & CO_SRC_TPROXY_MASK) == CO_SRC_TPROXY_DYN)
 				reuse = 0;
@@ -1041,79 +1121,112 @@ int connect_server(struct session *s)
 		}
 	}
 
-	srv_conn = si_alloc_conn(s->req->cons, reuse);
-	if (!srv_conn)
-		return SN_ERR_RESOURCE;
+	if (!reuse)
+		srv_conn = si_alloc_conn(&s->si[1]);
+	else {
+		/* reusing our connection, take it out of the idle list */
+		LIST_DEL(&srv_conn->list);
+		LIST_INIT(&srv_conn->list);
+	}
 
-	if (!(s->flags & SN_ADDR_SET)) {
+	if (!srv_conn)
+		return SF_ERR_RESOURCE;
+
+	if (!(s->flags & SF_ADDR_SET)) {
 		err = assign_server_address(s);
 		if (err != SRV_STATUS_OK)
-			return SN_ERR_INTERNAL;
+			return SF_ERR_INTERNAL;
 	}
 
 	if (!conn_xprt_ready(srv_conn)) {
-		/* the target was only on the session, assign it to the SI now */
+		/* the target was only on the stream, assign it to the SI now */
 		srv_conn->target = s->target;
 
 		/* set the correct protocol on the output stream interface */
-		if (objt_server(s->target)) {
-			conn_prepare(srv_conn, objt_server(s->target)->proto, objt_server(s->target)->xprt);
+		if (srv) {
+			conn_prepare(srv_conn, protocol_by_family(srv_conn->addr.to.ss_family), srv->xprt);
 		}
 		else if (obj_type(s->target) == OBJ_TYPE_PROXY) {
 			/* proxies exclusively run on raw_sock right now */
 			conn_prepare(srv_conn, protocol_by_family(srv_conn->addr.to.ss_family), &raw_sock);
-			if (!objt_conn(s->req->cons->end) || !objt_conn(s->req->cons->end)->ctrl)
-				return SN_ERR_INTERNAL;
+			if (!objt_conn(s->si[1].end) || !objt_conn(s->si[1].end)->ctrl)
+				return SF_ERR_INTERNAL;
 		}
 		else
-			return SN_ERR_INTERNAL;  /* how did we get there ? */
+			return SF_ERR_INTERNAL;  /* how did we get there ? */
 
 		/* process the case where the server requires the PROXY protocol to be sent */
 		srv_conn->send_proxy_ofs = 0;
-		if (objt_server(s->target) && objt_server(s->target)->pp_opts) {
+		if (srv && srv->pp_opts) {
+			srv_conn->flags |= CO_FL_PRIVATE;
 			srv_conn->send_proxy_ofs = 1; /* must compute size */
-			cli_conn = objt_conn(s->req->prod->end);
+			cli_conn = objt_conn(strm_orig(s));
 			if (cli_conn)
 				conn_get_to_addr(cli_conn);
 		}
 
-		si_attach_conn(s->req->cons, srv_conn);
+		si_attach_conn(&s->si[1], srv_conn);
 
 		assign_tproxy_address(s);
 	}
 	else {
 		/* the connection is being reused, just re-attach it */
-		si_attach_conn(s->req->cons, srv_conn);
-		s->flags |= SN_SRV_REUSED;
+		si_attach_conn(&s->si[1], srv_conn);
+		s->flags |= SF_SRV_REUSED;
 	}
 
 	/* flag for logging source ip/port */
-	if (s->fe->options2 & PR_O2_SRC_ADDR)
-		s->req->cons->flags |= SI_FL_SRC_ADDR;
+	if (strm_fe(s)->options2 & PR_O2_SRC_ADDR)
+		s->si[1].flags |= SI_FL_SRC_ADDR;
 
 	/* disable lingering */
 	if (s->be->options & PR_O_TCP_NOLING)
-		s->req->cons->flags |= SI_FL_NOLINGER;
+		s->si[1].flags |= SI_FL_NOLINGER;
 
-	err = si_connect(s->req->cons);
+	err = si_connect(&s->si[1]);
 
-	if (err != SN_ERR_NONE)
+	if (err != SF_ERR_NONE)
 		return err;
 
 	/* set connect timeout */
-	s->req->cons->exp = tick_add_ifset(now_ms, s->be->timeout.connect);
+	s->si[1].exp = tick_add_ifset(now_ms, s->be->timeout.connect);
 
-	srv = objt_server(s->target);
 	if (srv) {
-		s->flags |= SN_CURR_SESS;
+		s->flags |= SF_CURR_SESS;
 		srv->cur_sess++;
 		if (srv->cur_sess > srv->counters.cur_sess_max)
 			srv->counters.cur_sess_max = srv->cur_sess;
 		if (s->be->lbprm.server_take_conn)
 			s->be->lbprm.server_take_conn(srv);
+
+#ifdef USE_OPENSSL
+		if (srv->ssl_ctx.sni) {
+			struct sample *smp;
+			int rewind;
+
+			/* Tricky case : we have already scheduled the pending
+			 * HTTP request or TCP data for leaving. So in HTTP we
+			 * rewind exactly the headers, otherwise we rewind the
+			 * output data.
+			 */
+			rewind = s->txn ? http_hdr_rewind(&s->txn->req) : s->req.buf->o;
+			b_rew(s->req.buf, rewind);
+
+			smp = sample_fetch_as_type(s->be, s->sess, s, SMP_OPT_DIR_REQ | SMP_OPT_FINAL, srv->ssl_ctx.sni, SMP_T_STR);
+
+			/* restore the pointers */
+			b_adv(s->req.buf, rewind);
+
+			if (smp_make_safe(smp)) {
+				ssl_sock_set_servername(srv_conn, smp->data.u.str.str);
+				srv_conn->flags |= CO_FL_PRIVATE;
+			}
+		}
+#endif /* USE_OPENSSL */
+
 	}
 
-	return SN_ERR_NONE;  /* connection is OK */
+	return SF_ERR_NONE;  /* connection is OK */
 }
 
 
@@ -1125,7 +1238,7 @@ int connect_server(struct session *s)
  * that the connection is ready to use.
  */
 
-int srv_redispatch_connect(struct session *s)
+int srv_redispatch_connect(struct stream *s)
 {
 	struct server *srv;
 	int conn_err;
@@ -1149,14 +1262,14 @@ int srv_redispatch_connect(struct session *s)
 		 * would bring us on the same server again. Note that s->target is set
 		 * in this case.
 		 */
-		if (((s->flags & (SN_DIRECT|SN_FORCE_PRST)) == SN_DIRECT) &&
+		if (((s->flags & (SF_DIRECT|SF_FORCE_PRST)) == SF_DIRECT) &&
 		    (s->be->options & PR_O_REDISP)) {
-			s->flags &= ~(SN_DIRECT | SN_ASSIGNED | SN_ADDR_SET);
+			s->flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
 			goto redispatch;
 		}
 
-		if (!s->req->cons->err_type) {
-			s->req->cons->err_type = SI_ET_QUEUE_ERR;
+		if (!s->si[1].err_type) {
+			s->si[1].err_type = SI_ET_QUEUE_ERR;
 		}
 
 		srv->counters.failed_conns++;
@@ -1165,23 +1278,23 @@ int srv_redispatch_connect(struct session *s)
 
 	case SRV_STATUS_NOSRV:
 		/* note: it is guaranteed that srv == NULL here */
-		if (!s->req->cons->err_type) {
-			s->req->cons->err_type = SI_ET_CONN_ERR;
+		if (!s->si[1].err_type) {
+			s->si[1].err_type = SI_ET_CONN_ERR;
 		}
 
 		s->be->be_counters.failed_conns++;
 		return 1;
 
 	case SRV_STATUS_QUEUED:
-		s->req->cons->exp = tick_add_ifset(now_ms, s->be->timeout.queue);
-		s->req->cons->state = SI_ST_QUE;
-		/* do nothing else and do not wake any other session up */
+		s->si[1].exp = tick_add_ifset(now_ms, s->be->timeout.queue);
+		s->si[1].state = SI_ST_QUE;
+		/* do nothing else and do not wake any other stream up */
 		return 1;
 
 	case SRV_STATUS_INTERNAL:
 	default:
-		if (!s->req->cons->err_type) {
-			s->req->cons->err_type = SI_ET_CONN_OTHER;
+		if (!s->si[1].err_type) {
+			s->si[1].err_type = SI_ET_CONN_OTHER;
 		}
 
 		if (srv)
@@ -1192,7 +1305,7 @@ int srv_redispatch_connect(struct session *s)
 			srv->counters.failed_conns++;
 		s->be->be_counters.failed_conns++;
 
-		/* release other sessions waiting for this server */
+		/* release other streams waiting for this server */
 		if (may_dequeue_tasks(srv, s->be))
 			process_srv_queue(srv);
 		return 1;
@@ -1215,13 +1328,13 @@ void set_backend_down(struct proxy *be)
 	send_log(be, LOG_EMERG, "%s %s has no server available!\n", proxy_type_str(be), be->id);
 }
 
-/* Apply RDP cookie persistence to the current session. For this, the function
+/* Apply RDP cookie persistence to the current stream. For this, the function
  * tries to extract an RDP cookie from the request buffer, and look for the
  * matching server in the list. If the server is found, it is assigned to the
- * session. This always returns 1, and the analyser removes itself from the
+ * stream. This always returns 1, and the analyser removes itself from the
  * list. Nothing is performed if a server was already assigned.
  */
-int tcp_persist_rdp_cookie(struct session *s, struct channel *req, int an_bit)
+int tcp_persist_rdp_cookie(struct stream *s, struct channel *req, int an_bit)
 {
 	struct proxy    *px   = s->be;
 	int              ret;
@@ -1230,7 +1343,7 @@ int tcp_persist_rdp_cookie(struct session *s, struct channel *req, int an_bit)
 	struct sockaddr_in addr;
 	char *p;
 
-	DPRINTF(stderr,"[%u] %s: session=%p b=%p, exp(r,w)=%u,%u bf=%08x bh=%d analysers=%02x\n",
+	DPRINTF(stderr,"[%u] %s: stream=%p b=%p, exp(r,w)=%u,%u bf=%08x bh=%d analysers=%02x\n",
 		now_ms, __FUNCTION__,
 		s,
 		req,
@@ -1239,20 +1352,20 @@ int tcp_persist_rdp_cookie(struct session *s, struct channel *req, int an_bit)
 		req->buf->i,
 		req->analysers);
 
-	if (s->flags & SN_ASSIGNED)
+	if (s->flags & SF_ASSIGNED)
 		goto no_cookie;
 
 	memset(&smp, 0, sizeof(smp));
 
 	ret = fetch_rdp_cookie_name(s, &smp, s->be->rdp_cookie_name, s->be->rdp_cookie_len);
-	if (ret == 0 || (smp.flags & SMP_F_MAY_CHANGE) || smp.data.str.len == 0)
+	if (ret == 0 || (smp.flags & SMP_F_MAY_CHANGE) || smp.data.u.str.len == 0)
 		goto no_cookie;
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 
 	/* Considering an rdp cookie detected using acl, str ended with <cr><lf> and should return */
-	addr.sin_addr.s_addr = strtoul(smp.data.str.str, &p, 10);
+	addr.sin_addr.s_addr = strtoul(smp.data.u.str.str, &p, 10);
 	if (*p != '.')
 		goto no_cookie;
 	p++;
@@ -1266,7 +1379,7 @@ int tcp_persist_rdp_cookie(struct session *s, struct channel *req, int an_bit)
 		    memcmp(&addr, &(srv->addr), sizeof(addr)) == 0) {
 			if ((srv->state != SRV_ST_STOPPED) || (px->options & PR_O_PERSIST)) {
 				/* we found the server and it is usable */
-				s->flags |= SN_DIRECT | SN_ASSIGNED;
+				s->flags |= SF_DIRECT | SF_ASSIGNED;
 				s->target = &srv->obj_type;
 				break;
 			}
@@ -1481,19 +1594,20 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
  * undefined behaviour.
  */
 static int
-smp_fetch_nbsrv(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_nbsrv(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
+	struct proxy *px;
+
 	smp->flags = SMP_F_VOL_TEST;
-	smp->type = SMP_T_UINT;
+	smp->data.type = SMP_T_SINT;
 	px = args->data.prx;
 
 	if (px->srv_act)
-		smp->data.uint = px->srv_act;
+		smp->data.u.sint = px->srv_act;
 	else if (px->lbprm.fbck)
-		smp->data.uint = 1;
+		smp->data.u.sint = 1;
 	else
-		smp->data.uint = px->srv_bck;
+		smp->data.u.sint = px->srv_bck;
 
 	return 1;
 }
@@ -1504,18 +1618,17 @@ smp_fetch_nbsrv(struct proxy *px, struct session *l4, void *l7, unsigned int opt
  * undefined behaviour.
  */
 static int
-smp_fetch_srv_is_up(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                    const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_srv_is_up(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	struct server *srv = args->data.srv;
 
 	smp->flags = SMP_F_VOL_TEST;
-	smp->type = SMP_T_BOOL;
+	smp->data.type = SMP_T_BOOL;
 	if (!(srv->admin & SRV_ADMF_MAINT) &&
 	    (!(srv->check.state & CHK_ST_CONFIGURED) || (srv->state != SRV_ST_STOPPED)))
-		smp->data.uint = 1;
+		smp->data.u.sint = 1;
 	else
-		smp->data.uint = 0;
+		smp->data.u.sint = 0;
 	return 1;
 }
 
@@ -1524,14 +1637,13 @@ smp_fetch_srv_is_up(struct proxy *px, struct session *l4, void *l7, unsigned int
  * undefined behaviour.
  */
 static int
-smp_fetch_connslots(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                    const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_connslots(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	struct server *iterator;
 
 	smp->flags = SMP_F_VOL_TEST;
-	smp->type = SMP_T_UINT;
-	smp->data.uint = 0;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = 0;
 
 	for (iterator = args->data.prx->srv; iterator; iterator = iterator->next) {
 		if (iterator->state == SRV_ST_STOPPED)
@@ -1539,11 +1651,11 @@ smp_fetch_connslots(struct proxy *px, struct session *l4, void *l7, unsigned int
 
 		if (iterator->maxconn == 0 || iterator->maxqueue == 0) {
 			/* configuration is stupid */
-			smp->data.uint = -1;  /* FIXME: stupid value! */
+			smp->data.u.sint = -1;  /* FIXME: stupid value! */
 			return 1;
 		}
 
-		smp->data.uint += (iterator->maxconn - iterator->cur_sess)
+		smp->data.u.sint += (iterator->maxconn - iterator->cur_sess)
 		                       +  (iterator->maxqueue - iterator->nbpend);
 	}
 
@@ -1552,25 +1664,29 @@ smp_fetch_connslots(struct proxy *px, struct session *l4, void *l7, unsigned int
 
 /* set temp integer to the id of the backend */
 static int
-smp_fetch_be_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_be_id(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
+	if (!smp->strm)
+		return 0;
+
 	smp->flags = SMP_F_VOL_TXN;
-	smp->type = SMP_T_UINT;
-	smp->data.uint = l4->be->uuid;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = smp->strm->be->uuid;
 	return 1;
 }
 
 /* set temp integer to the id of the server */
 static int
-smp_fetch_srv_id(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                 const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_srv_id(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	if (!objt_server(l4->target))
+	if (!smp->strm)
 		return 0;
 
-	smp->type = SMP_T_UINT;
-	smp->data.uint = objt_server(l4->target)->puid;
+	if (!objt_server(smp->strm->target))
+		return 0;
+
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = objt_server(smp->strm->target)->puid;
 
 	return 1;
 }
@@ -1580,12 +1696,11 @@ smp_fetch_srv_id(struct proxy *px, struct session *l4, void *l7, unsigned int op
  * undefined behaviour.
  */
 static int
-smp_fetch_be_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                       const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_be_sess_rate(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	smp->flags = SMP_F_VOL_TEST;
-	smp->type = SMP_T_UINT;
-	smp->data.uint = read_freq_ctr(&args->data.prx->be_sess_per_sec);
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = read_freq_ctr(&args->data.prx->be_sess_per_sec);
 	return 1;
 }
 
@@ -1594,12 +1709,11 @@ smp_fetch_be_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned 
  * undefined behaviour.
  */
 static int
-smp_fetch_be_conn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                  const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_be_conn(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	smp->flags = SMP_F_VOL_TEST;
-	smp->type = SMP_T_UINT;
-	smp->data.uint = args->data.prx->beconn;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = args->data.prx->beconn;
 	return 1;
 }
 
@@ -1608,12 +1722,11 @@ smp_fetch_be_conn(struct proxy *px, struct session *l4, void *l7, unsigned int o
  * undefined behaviour.
  */
 static int
-smp_fetch_queue_size(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                     const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_queue_size(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	smp->flags = SMP_F_VOL_TEST;
-	smp->type = SMP_T_UINT;
-	smp->data.uint = args->data.prx->totpend;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = args->data.prx->totpend;
 	return 1;
 }
 
@@ -1626,13 +1739,13 @@ smp_fetch_queue_size(struct proxy *px, struct session *l4, void *l7, unsigned in
  * undefined behaviour.
  */
 static int
-smp_fetch_avg_queue_size(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                         const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_avg_queue_size(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	int nbsrv;
+	struct proxy *px;
 
 	smp->flags = SMP_F_VOL_TEST;
-	smp->type = SMP_T_UINT;
+	smp->data.type = SMP_T_SINT;
 	px = args->data.prx;
 
 	if (px->srv_act)
@@ -1643,9 +1756,9 @@ smp_fetch_avg_queue_size(struct proxy *px, struct session *l4, void *l7, unsigne
 		nbsrv = px->srv_bck;
 
 	if (nbsrv > 0)
-		smp->data.uint = (px->totpend + nbsrv - 1) / nbsrv;
+		smp->data.u.sint = (px->totpend + nbsrv - 1) / nbsrv;
 	else
-		smp->data.uint = px->totpend * 2;
+		smp->data.u.sint = px->totpend * 2;
 
 	return 1;
 }
@@ -1655,12 +1768,11 @@ smp_fetch_avg_queue_size(struct proxy *px, struct session *l4, void *l7, unsigne
  * undefined behaviour.
  */
 static int
-smp_fetch_srv_conn(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                   const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_srv_conn(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	smp->flags = SMP_F_VOL_TEST;
-	smp->type = SMP_T_UINT;
-	smp->data.uint = args->data.srv->cur_sess;
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = args->data.srv->cur_sess;
 	return 1;
 }
 
@@ -1669,12 +1781,11 @@ smp_fetch_srv_conn(struct proxy *px, struct session *l4, void *l7, unsigned int 
  * undefined behaviour.
  */
 static int
-smp_fetch_srv_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned int opt,
-                        const struct arg *args, struct sample *smp, const char *kw)
+smp_fetch_srv_sess_rate(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	smp->flags = SMP_F_VOL_TEST;
-	smp->type = SMP_T_UINT;
-	smp->data.uint = read_freq_ctr(&args->data.srv->sess_per_sec);
+	smp->data.type = SMP_T_SINT;
+	smp->data.u.sint = read_freq_ctr(&args->data.srv->sess_per_sec);
 	return 1;
 }
 
@@ -1683,17 +1794,17 @@ smp_fetch_srv_sess_rate(struct proxy *px, struct session *l4, void *l7, unsigned
  * Please take care of keeping this list alphabetically sorted.
  */
 static struct sample_fetch_kw_list smp_kws = {ILH, {
-	{ "avg_queue",     smp_fetch_avg_queue_size, ARG1(1,BE),  NULL, SMP_T_UINT, SMP_USE_INTRN, },
-	{ "be_conn",       smp_fetch_be_conn,        ARG1(1,BE),  NULL, SMP_T_UINT, SMP_USE_INTRN, },
-	{ "be_id",         smp_fetch_be_id,          0,           NULL, SMP_T_UINT, SMP_USE_BKEND, },
-	{ "be_sess_rate",  smp_fetch_be_sess_rate,   ARG1(1,BE),  NULL, SMP_T_UINT, SMP_USE_INTRN, },
-	{ "connslots",     smp_fetch_connslots,      ARG1(1,BE),  NULL, SMP_T_UINT, SMP_USE_INTRN, },
-	{ "nbsrv",         smp_fetch_nbsrv,          ARG1(1,BE),  NULL, SMP_T_UINT, SMP_USE_INTRN, },
-	{ "queue",         smp_fetch_queue_size,     ARG1(1,BE),  NULL, SMP_T_UINT, SMP_USE_INTRN, },
-	{ "srv_conn",      smp_fetch_srv_conn,       ARG1(1,SRV), NULL, SMP_T_UINT, SMP_USE_INTRN, },
-	{ "srv_id",        smp_fetch_srv_id,         0,           NULL, SMP_T_UINT, SMP_USE_SERVR, },
+	{ "avg_queue",     smp_fetch_avg_queue_size, ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "be_conn",       smp_fetch_be_conn,        ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "be_id",         smp_fetch_be_id,          0,           NULL, SMP_T_SINT, SMP_USE_BKEND, },
+	{ "be_sess_rate",  smp_fetch_be_sess_rate,   ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "connslots",     smp_fetch_connslots,      ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "nbsrv",         smp_fetch_nbsrv,          ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "queue",         smp_fetch_queue_size,     ARG1(1,BE),  NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "srv_conn",      smp_fetch_srv_conn,       ARG1(1,SRV), NULL, SMP_T_SINT, SMP_USE_INTRN, },
+	{ "srv_id",        smp_fetch_srv_id,         0,           NULL, SMP_T_SINT, SMP_USE_SERVR, },
 	{ "srv_is_up",     smp_fetch_srv_is_up,      ARG1(1,SRV), NULL, SMP_T_BOOL, SMP_USE_INTRN, },
-	{ "srv_sess_rate", smp_fetch_srv_sess_rate,  ARG1(1,SRV), NULL, SMP_T_UINT, SMP_USE_INTRN, },
+	{ "srv_sess_rate", smp_fetch_srv_sess_rate,  ARG1(1,SRV), NULL, SMP_T_SINT, SMP_USE_INTRN, },
 	{ /* END */ },
 }};
 

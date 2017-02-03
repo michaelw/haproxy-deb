@@ -390,7 +390,6 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			expr->pat.expect_type = pat_match_types[PAT_MATCH_BOOL];
 			break;
 		case SMP_T_SINT:
-		case SMP_T_UINT:
 			expr->pat.parse = pat_parse_fcts[PAT_MATCH_INT];
 			expr->pat.index = pat_index_fcts[PAT_MATCH_INT];
 			expr->pat.match = pat_match_fcts[PAT_MATCH_INT];
@@ -488,7 +487,7 @@ struct acl_expr *parse_acl_expr(const char **args, char **err, struct arg_list *
 			}
 
 			/* Note: -m found is always valid, bool/int are compatible, str/bin/reg/len are compatible */
-			if (!sample_casts[cur_type][pat_match_types[idx]]) {
+			if (idx != PAT_MATCH_FOUND && !sample_casts[cur_type][pat_match_types[idx]]) {
 				memprintf(err, "matching method '%s' cannot be used with fetch keyword '%s'", args[1], expr->kw);
 				goto out_free_expr;
 			}
@@ -1097,7 +1096,7 @@ struct acl_cond *build_acl_cond(const char *file, int line, struct proxy *px, co
  *     if (cond->pol == ACL_COND_UNLESS)
  *         res = !res;
  */
-enum acl_test_res acl_exec_cond(struct acl_cond *cond, struct proxy *px, struct session *l4, void *l7, unsigned int opt)
+enum acl_test_res acl_exec_cond(struct acl_cond *cond, struct proxy *px, struct session *sess, struct stream *strm, unsigned int opt)
 {
 	__label__ fetch_next;
 	struct acl_term_suite *suite;
@@ -1141,7 +1140,7 @@ enum acl_test_res acl_exec_cond(struct acl_cond *cond, struct proxy *px, struct 
 				/* we need to reset context and flags */
 				memset(&smp, 0, sizeof(smp));
 			fetch_next:
-				if (!sample_process(px, l4, l7, opt, expr->smp, &smp)) {
+				if (!sample_process(px, sess, strm, opt, expr->smp, &smp)) {
 					/* maybe we could not fetch because of missing data */
 					if (smp.flags & SMP_F_MAY_CHANGE && !(opt & SMP_OPT_FINAL))
 						acl_res |= ACL_TEST_MISS;

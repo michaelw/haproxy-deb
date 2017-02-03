@@ -37,7 +37,9 @@
 #include <common/version.h>
 #include <common/base64.h>
 
+#include <types/applet.h>
 #include <types/global.h>
+#include <types/dns.h>
 
 #include <proto/backend.h>
 #include <proto/channel.h>
@@ -46,6 +48,7 @@
 #include <proto/dumpstats.h>
 #include <proto/fd.h>
 #include <proto/freq_ctr.h>
+#include <proto/frontend.h>
 #include <proto/log.h>
 #include <proto/pattern.h>
 #include <proto/pipe.h>
@@ -56,6 +59,7 @@
 #include <proto/proxy.h>
 #include <proto/sample.h>
 #include <proto/session.h>
+#include <proto/stream.h>
 #include <proto/server.h>
 #include <proto/raw_sock.h>
 #include <proto/stream_interface.h>
@@ -63,6 +67,7 @@
 
 #ifdef USE_OPENSSL
 #include <proto/ssl_sock.h>
+#include <types/ssl_sock.h>
 #endif
 
 /* stats socket states */
@@ -75,16 +80,20 @@ enum {
 	STAT_CLI_PRINT,      /* display message in cli->msg */
 	STAT_CLI_PRINT_FREE, /* display message in cli->msg. After the display, free the pointer */
 	STAT_CLI_O_INFO,     /* dump info */
-	STAT_CLI_O_SESS,     /* dump sessions */
+	STAT_CLI_O_SESS,     /* dump streams */
 	STAT_CLI_O_ERR,      /* dump errors */
 	STAT_CLI_O_TAB,      /* dump tables */
 	STAT_CLI_O_CLR,      /* clear tables */
 	STAT_CLI_O_SET,      /* set entries in tables */
 	STAT_CLI_O_STAT,     /* dump stats */
-	STAT_CLI_O_PATS,     /* list all pattern reference avalaible */
+	STAT_CLI_O_PATS,     /* list all pattern reference available */
 	STAT_CLI_O_PAT,      /* list all entries of a pattern */
 	STAT_CLI_O_MLOOK,    /* lookup a map entry */
 	STAT_CLI_O_POOLS,    /* dump memory pools */
+	STAT_CLI_O_TLSK,     /* list all TLS ticket keys references */
+	STAT_CLI_O_RESOLVERS,/* dump a resolver's section nameservers counters */
+	STAT_CLI_O_SERVERS_STATE, /* dump server state and changing information */
+	STAT_CLI_O_BACKEND,  /* dump backend list */
 };
 
 /* Actions available for the stats admin forms */
@@ -120,25 +129,36 @@ enum {
 	ST_ADM_ACTION_START,
 };
 
+static int stats_dump_backend_to_buffer(struct stream_interface *si);
 static int stats_dump_info_to_buffer(struct stream_interface *si);
+static int stats_dump_servers_state_to_buffer(struct stream_interface *si);
 static int stats_dump_pools_to_buffer(struct stream_interface *si);
-static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct session *sess);
+static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct stream *sess);
 static int stats_dump_sess_to_buffer(struct stream_interface *si);
 static int stats_dump_errors_to_buffer(struct stream_interface *si);
 static int stats_table_request(struct stream_interface *si, int show);
 static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, struct uri_auth *uri);
 static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_auth *uri);
+static int stats_dump_resolvers_to_buffer(struct stream_interface *si);
 static int stats_pats_list(struct stream_interface *si);
 static int stats_pat_list(struct stream_interface *si);
 static int stats_map_lookup(struct stream_interface *si);
-static void cli_release_handler(struct stream_interface *si);
+#if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
+static int stats_tlskeys_list(struct stream_interface *si);
+#endif
+static void cli_release_handler(struct appctx *appctx);
+
+static int dump_servers_state(struct stream_interface *si, struct chunk *buf);
 
 /*
  * cli_io_handler()
  *     -> stats_dump_sess_to_buffer()     // "show sess"
  *     -> stats_dump_errors_to_buffer()   // "show errors"
  *     -> stats_dump_info_to_buffer()     // "show info"
+ *     -> stats_dump_backend_to_buffer()  // "show backend"
+ *     -> stats_dump_servers_state_to_buffer() // "show servers state [<backend name>]"
  *     -> stats_dump_stat_to_buffer()     // "show stat"
+ *        -> stats_dump_resolvers_to_buffer() // "show stat resolvers <id>"
  *        -> stats_dump_csv_header()
  *        -> stats_dump_proxy_to_buffer()
  *           -> stats_dump_fe_stats()
@@ -161,7 +181,7 @@ static void cli_release_handler(struct stream_interface *si);
  *        -> stats_dump_html_end()       // emits HTML trailer
  */
 
-static struct si_applet cli_applet;
+static struct applet cli_applet;
 
 static const char stats_sock_usage_msg[] =
 	"Unknown command. Please enter one of the following commands only :\n"
@@ -170,15 +190,19 @@ static const char stats_sock_usage_msg[] =
 	"  help           : this message\n"
 	"  prompt         : toggle interactive mode with prompt\n"
 	"  quit           : disconnect\n"
+	"  show backend   : list backends in the current running config\n"
 	"  show info      : report information about the running process\n"
 	"  show pools     : report information about the memory pools usage\n"
 	"  show stat      : report counters for each proxy and server\n"
+	"  show stat resolvers [id]: dumps counters from all resolvers section and\n"
+	"                            associated name servers\n"
 	"  show errors    : report last request and response errors for each proxy\n"
 	"  show sess [id] : report the list of current sessions or dump this session\n"
 	"  show table [id]: report table usage stats or dump this table's contents\n"
+	"  show servers state [id]: dump volatile server information (for backend <id>)\n"
 	"  get weight     : report a server's current weight\n"
 	"  set weight     : change a server's weight\n"
-	"  set server     : change a server's state or weight\n"
+	"  set server     : change a server's state, weight or address\n"
 	"  set table [id] : update or create a table entry's data\n"
 	"  set timeout    : change a timeout setting\n"
 	"  set maxconn    : change a maxconn setting\n"
@@ -186,12 +210,12 @@ static const char stats_sock_usage_msg[] =
 	"  disable        : put a server or frontend in maintenance mode\n"
 	"  enable         : re-enable a server or frontend which is in maintenance mode\n"
 	"  shutdown       : kill a session or a frontend (eg:to release listening ports)\n"
-	"  show acl [id]  : report avalaible acls or dump an acl's contents\n"
+	"  show acl [id]  : report available acls or dump an acl's contents\n"
 	"  get acl        : reports the patterns matching a sample for an ACL\n"
 	"  add acl        : add acl entry\n"
 	"  del acl        : delete acl entry\n"
 	"  clear acl <id> : clear the content of this acl\n"
-	"  show map [id]  : report avalaible maps or dump a map's contents\n"
+	"  show map [id]  : report available maps or dump a map's contents\n"
 	"  get map        : reports the keys and values matching a sample for a map\n"
 	"  set map        : modify map entry\n"
 	"  add map        : add map entry\n"
@@ -228,33 +252,6 @@ enum {
 
 extern const char *stat_status_codes[];
 
-/* This function is called from the session-level accept() in order to instanciate
- * a new stats socket. It returns a positive value upon success, 0 if the session
- * needs to be closed and ignored, or a negative value upon critical failure.
- */
-static int stats_accept(struct session *s)
-{
-	s->target = &cli_applet.obj_type;
-	/* no need to initialize the applet, it will start with st0=st1 = 0 */
-
-	tv_zero(&s->logs.tv_request);
-	s->logs.t_queue = 0;
-	s->logs.t_connect = 0;
-	s->logs.t_data = 0;
-	s->logs.t_close = 0;
-	s->logs.bytes_in = s->logs.bytes_out = 0;
-	s->logs.prx_queue_size = 0;  /* we get the number of pending conns before us */
-	s->logs.srv_queue_size = 0; /* we will get this number soon */
-
-	s->req->flags |= CF_READ_DONTWAIT; /* we plan to read small requests */
-
-	if (s->listener->timeout) {
-		s->req->rto = *s->listener->timeout;
-		s->rep->wto = *s->listener->timeout;
-	}
-	return 1;
-}
-
 /* allocate a new stats frontend named <name>, and return it
  * (or NULL in case of lack of memory).
  */
@@ -276,7 +273,8 @@ static struct proxy *alloc_stats_fe(const char *name, const char *file, int line
 	fe->timeout.client = MS_TO_TICKS(10000); /* default timeout of 10 seconds */
 	fe->conf.file = strdup(file);
 	fe->conf.line = line;
-	fe->accept = stats_accept;
+	fe->accept = frontend_accept;
+	fe->default_target = &cli_applet.obj_type;
 
 	/* the stats frontend is the only one able to assign ID #0 */
 	fe->conf.id.key = fe->uuid = 0;
@@ -334,7 +332,7 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 					return -1;
 				}
 
-				if (kw->parse(args, cur_arg, curpx, bind_conf, err) != 0) {
+				if (kw->parse(args, cur_arg, global.stats_fe, bind_conf, err) != 0) {
 					if (err && *err)
 						memprintf(err, "'%s %s' : '%s'", args[0], args[1], *err);
 					else
@@ -362,9 +360,9 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 		list_for_each_entry(l, &bind_conf->listeners, by_bind) {
 			l->maxconn = global.stats_fe->maxconn;
 			l->backlog = global.stats_fe->backlog;
-			l->timeout = &global.stats_fe->timeout.client;
-			l->accept = session_accept;
-			l->handler = process_session;
+			l->accept = session_accept_fd;
+			l->handler = process_stream;
+			l->default_target = global.stats_fe->default_target;
 			l->options |= LI_O_UNLIMITED; /* don't make the peers subject to global limits */
 			l->nice = -64;  /* we want to boost priority for local stats */
 			global.maxsock += l->maxconn;
@@ -569,18 +567,20 @@ static int dump_binary(struct chunk *out, const char *buf, int bsize)
 static int stats_dump_table_head_to_buffer(struct chunk *msg, struct stream_interface *si,
 					   struct proxy *proxy, struct proxy *target)
 {
-	struct session *s = session_from_task(si->owner);
+	struct stream *s = si_strm(si);
 
 	chunk_appendf(msg, "# table: %s, type: %s, size:%d, used:%d\n",
 		     proxy->id, stktable_types[proxy->table.type].kw, proxy->table.size, proxy->table.current);
 
 	/* any other information should be dumped here */
 
-	if (target && s->listener->bind_conf->level < ACCESS_LVL_OPER)
+	if (target && strm_li(s)->bind_conf->level < ACCESS_LVL_OPER)
 		chunk_appendf(msg, "# contents not dumped due to insufficient privileges\n");
 
-	if (bi_putchk(si->ib, msg) == -1)
+	if (bi_putchk(si_ic(si), msg) == -1) {
+		si_applet_cant_put(si);
 		return 0;
+	}
 
 	return 1;
 }
@@ -596,20 +596,20 @@ static int stats_dump_table_entry_to_buffer(struct chunk *msg, struct stream_int
 
 	chunk_appendf(msg, "%p:", entry);
 
-	if (proxy->table.type == STKTABLE_TYPE_IP) {
+	if (proxy->table.type == SMP_T_IPV4) {
 		char addr[INET_ADDRSTRLEN];
 		inet_ntop(AF_INET, (const void *)&entry->key.key, addr, sizeof(addr));
 		chunk_appendf(msg, " key=%s", addr);
 	}
-	else if (proxy->table.type == STKTABLE_TYPE_IPV6) {
+	else if (proxy->table.type == SMP_T_IPV6) {
 		char addr[INET6_ADDRSTRLEN];
 		inet_ntop(AF_INET6, (const void *)&entry->key.key, addr, sizeof(addr));
 		chunk_appendf(msg, " key=%s", addr);
 	}
-	else if (proxy->table.type == STKTABLE_TYPE_INTEGER) {
+	else if (proxy->table.type == SMP_T_SINT) {
 		chunk_appendf(msg, " key=%u", *(unsigned int *)entry->key.key);
 	}
-	else if (proxy->table.type == STKTABLE_TYPE_STRING) {
+	else if (proxy->table.type == SMP_T_STR) {
 		chunk_appendf(msg, " key=");
 		dump_text(msg, (const char *)entry->key.key, proxy->table.key_size);
 	}
@@ -650,15 +650,17 @@ static int stats_dump_table_entry_to_buffer(struct chunk *msg, struct stream_int
 	}
 	chunk_appendf(msg, "\n");
 
-	if (bi_putchk(si->ib, msg) == -1)
+	if (bi_putchk(si_ic(si), msg) == -1) {
+		si_applet_cant_put(si);
 		return 0;
+	}
 
 	return 1;
 }
 
 static void stats_sock_table_key_request(struct stream_interface *si, char **args, int action)
 {
-	struct session *s = session_from_task(si->owner);
+	struct stream *s = si_strm(si);
 	struct appctx *appctx = __objt_appctx(si->end);
 	struct proxy *px = appctx->ctx.table.target;
 	struct stksess *ts;
@@ -679,15 +681,15 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 	}
 
 	switch (px->table.type) {
-	case STKTABLE_TYPE_IP:
+	case SMP_T_IPV4:
 		uint32_key = htonl(inetaddr_host(args[4]));
 		static_table_key->key = &uint32_key;
 		break;
-	case STKTABLE_TYPE_IPV6:
+	case SMP_T_IPV6:
 		inet_pton(AF_INET6, args[4], ip6_key);
 		static_table_key->key = &ip6_key;
 		break;
-	case STKTABLE_TYPE_INTEGER:
+	case SMP_T_SINT:
 		{
 			char *endptr;
 			unsigned long val;
@@ -705,7 +707,7 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 			break;
 		}
 		break;
-	case STKTABLE_TYPE_STRING:
+	case SMP_T_STR:
 		static_table_key->key = args[4];
 		static_table_key->key_len = strlen(args[4]);
 		break;
@@ -726,7 +728,7 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 	}
 
 	/* check permissions */
-	if (s->listener->bind_conf->level < ACCESS_LVL_OPER) {
+	if (strm_li(s)->bind_conf->level < ACCESS_LVL_OPER) {
 		appctx->ctx.cli.msg = stats_permission_denied_msg;
 		appctx->st0 = STAT_CLI_PRINT;
 		return;
@@ -880,7 +882,7 @@ static void stats_sock_table_request(struct stream_interface *si, char **args, i
 	appctx->st0 = action;
 
 	if (*args[2]) {
-		appctx->ctx.table.target = find_stktable(args[2]);
+		appctx->ctx.table.target = proxy_tbl_by_name(args[2]);
 		if (!appctx->ctx.table.target) {
 			appctx->ctx.cli.msg = "No such table\n";
 			appctx->st0 = STAT_CLI_PRINT;
@@ -918,15 +920,15 @@ err_args:
 }
 
 /* Expects to find a frontend named <arg> and returns it, otherwise displays various
- * adequate error messages and returns NULL. This function also expects the session
+ * adequate error messages and returns NULL. This function also expects the stream
  * level to be admin.
  */
-static struct proxy *expect_frontend_admin(struct session *s, struct stream_interface *si, const char *arg)
+static struct proxy *expect_frontend_admin(struct stream *s, struct stream_interface *si, const char *arg)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
 	struct proxy *px;
 
-	if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+	if (strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN) {
 		appctx->ctx.cli.msg = stats_permission_denied_msg;
 		appctx->st0 = STAT_CLI_PRINT;
 		return NULL;
@@ -938,7 +940,7 @@ static struct proxy *expect_frontend_admin(struct session *s, struct stream_inte
 		return NULL;
 	}
 
-	px = findproxy(arg, PR_CAP_FE);
+	px = proxy_fe_by_name(arg);
 	if (!px) {
 		appctx->ctx.cli.msg = "No such frontend.\n";
 		appctx->st0 = STAT_CLI_PRINT;
@@ -949,17 +951,17 @@ static struct proxy *expect_frontend_admin(struct session *s, struct stream_inte
 
 /* Expects to find a backend and a server in <arg> under the form <backend>/<server>,
  * and returns the pointer to the server. Otherwise, display adequate error messages
- * and returns NULL. This function also expects the session level to be admin. Note:
+ * and returns NULL. This function also expects the stream level to be admin. Note:
  * the <arg> is modified to remove the '/'.
  */
-static struct server *expect_server_admin(struct session *s, struct stream_interface *si, char *arg)
+static struct server *expect_server_admin(struct stream *s, struct stream_interface *si, char *arg)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
 	struct proxy *px;
 	struct server *sv;
 	char *line;
 
-	if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+	if (strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN) {
 		appctx->ctx.cli.msg = stats_permission_denied_msg;
 		appctx->st0 = STAT_CLI_PRINT;
 		return NULL;
@@ -992,6 +994,51 @@ static struct server *expect_server_admin(struct session *s, struct stream_inter
 
 	return sv;
 }
+
+/* This function is used with TLS ticket keys management. It permits to browse
+ * each reference. The variable <getnext> must contain the current node,
+ * <end> point to the root node.
+ */
+#if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
+static inline
+struct tls_keys_ref *tlskeys_list_get_next(struct tls_keys_ref *getnext, struct list *end)
+{
+	struct tls_keys_ref *ref = getnext;
+
+	while (1) {
+
+		/* Get next list entry. */
+		ref = LIST_NEXT(&ref->list, struct tls_keys_ref *, list);
+
+		/* If the entry is the last of the list, return NULL. */
+		if (&ref->list == end)
+			return NULL;
+
+		return ref;
+	}
+}
+
+static inline
+struct tls_keys_ref *tlskeys_ref_lookup_ref(const char *reference)
+{
+	int id;
+	char *error;
+
+	/* If the reference starts by a '#', this is numeric id. */
+	if (reference[0] == '#') {
+		/* Try to convert the numeric id. If the conversion fails, the lookup fails. */
+		id = strtol(reference + 1, &error, 10);
+		if (*error != '\0')
+			return NULL;
+
+		/* Perform the unique id lookup. */
+		return tlskeys_ref_lookupid(id);
+	}
+
+	/* Perform the string lookup. */
+	return tlskeys_ref_lookup(reference);
+}
+#endif
 
 /* This function is used with map and acl management. It permits to browse
  * each reference. The variable <getnext> must contain the current node,
@@ -1061,7 +1108,7 @@ struct pattern_expr *pat_expr_get_next(struct pattern_expr *getnext, struct list
  */
 static int stats_sock_parse_request(struct stream_interface *si, char *line)
 {
-	struct session *s = session_from_task(si->owner);
+	struct stream *s = si_strm(si);
 	struct appctx *appctx = __objt_appctx(si->end);
 	char *args[MAX_STATS_ARGS + 1];
 	int arg;
@@ -1113,8 +1160,35 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 	appctx->ctx.stats.scope_len = 0;
 	appctx->ctx.stats.flags = 0;
 	if (strcmp(args[0], "show") == 0) {
-		if (strcmp(args[1], "stat") == 0) {
-			if (*args[2] && *args[3] && *args[4]) {
+		if (strcmp(args[1], "backend") == 0) {
+			appctx->ctx.be.px = NULL;
+			appctx->st2 = STAT_ST_INIT;
+			appctx->st0 = STAT_CLI_O_BACKEND;
+		}
+		 else if (strcmp(args[1], "stat") == 0) {
+			if (strcmp(args[2], "resolvers") == 0) {
+				struct dns_resolvers *presolvers;
+
+				if (*args[3]) {
+					appctx->ctx.resolvers.ptr = NULL;
+					list_for_each_entry(presolvers, &dns_resolvers, list) {
+						if (strcmp(presolvers->id, args[3]) == 0) {
+							appctx->ctx.resolvers.ptr = presolvers;
+							break;
+						}
+					}
+					if (appctx->ctx.resolvers.ptr == NULL) {
+						appctx->ctx.cli.msg = "Can't find that resolvers section\n";
+						appctx->st0 = STAT_CLI_PRINT;
+						return 1;
+					}
+				}
+
+				appctx->st2 = STAT_ST_INIT;
+				appctx->st0 = STAT_CLI_O_RESOLVERS;
+				return 1;
+			}
+			else if (*args[2] && *args[3] && *args[4]) {
 				appctx->ctx.stats.flags |= STAT_BOUND;
 				appctx->ctx.stats.iid = atoi(args[2]);
 				appctx->ctx.stats.type = atoi(args[3]);
@@ -1128,13 +1202,34 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			appctx->st2 = STAT_ST_INIT;
 			appctx->st0 = STAT_CLI_O_INFO; // stats_dump_info_to_buffer
 		}
+		else if (strcmp(args[1], "servers") == 0 && strcmp(args[2], "state") == 0) {
+			appctx->ctx.server_state.iid = 0;
+			appctx->ctx.server_state.px = NULL;
+			appctx->ctx.server_state.sv = NULL;
+
+			/* check if a backend name has been provided */
+			if (*args[3]) {
+				/* read server state from local file */
+				appctx->ctx.server_state.px = proxy_be_by_name(args[3]);
+
+				if (!appctx->ctx.server_state.px) {
+					appctx->ctx.cli.msg = "Can't find backend.\n";
+					appctx->st0 = STAT_CLI_PRINT;
+					return 1;
+				}
+				appctx->ctx.server_state.iid = appctx->ctx.server_state.px->uuid;
+			}
+			appctx->st2 = STAT_ST_INIT;
+			appctx->st0 = STAT_CLI_O_SERVERS_STATE; // stats_dump_servers_state_to_buffer
+			return 1;
+		}
 		else if (strcmp(args[1], "pools") == 0) {
 			appctx->st2 = STAT_ST_INIT;
 			appctx->st0 = STAT_CLI_O_POOLS; // stats_dump_pools_to_buffer
 		}
 		else if (strcmp(args[1], "sess") == 0) {
 			appctx->st2 = STAT_ST_INIT;
-			if (s->listener->bind_conf->level < ACCESS_LVL_OPER) {
+			if (strm_li(s)->bind_conf->level < ACCESS_LVL_OPER) {
 				appctx->ctx.cli.msg = stats_permission_denied_msg;
 				appctx->st0 = STAT_CLI_PRINT;
 				return 1;
@@ -1145,12 +1240,12 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				appctx->ctx.sess.target = (void *)strtoul(args[2], NULL, 0);
 			else
 				appctx->ctx.sess.target = NULL;
-			appctx->ctx.sess.section = 0; /* start with session status */
+			appctx->ctx.sess.section = 0; /* start with stream status */
 			appctx->ctx.sess.pos = 0;
 			appctx->st0 = STAT_CLI_O_SESS; // stats_dump_sess_to_buffer
 		}
 		else if (strcmp(args[1], "errors") == 0) {
-			if (s->listener->bind_conf->level < ACCESS_LVL_OPER) {
+			if (strm_li(s)->bind_conf->level < ACCESS_LVL_OPER) {
 				appctx->ctx.cli.msg = stats_permission_denied_msg;
 				appctx->st0 = STAT_CLI_PRINT;
 				return 1;
@@ -1166,6 +1261,17 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 		else if (strcmp(args[1], "table") == 0) {
 			stats_sock_table_request(si, args, STAT_CLI_O_TAB);
 		}
+		else if (strcmp(args[1], "tls-keys") == 0) {
+#if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
+			appctx->st2 = STAT_ST_INIT;
+			appctx->st0 = STAT_CLI_O_TLSK;
+#else
+			appctx->ctx.cli.msg = "HAProxy was compiled against a version of OpenSSL "
+						"that doesn't support specifying TLS ticket keys\n";
+			appctx->st0 = STAT_CLI_PRINT;
+#endif
+			return 1;
+		}
 		else if (strcmp(args[1], "map") == 0 ||
 		         strcmp(args[1], "acl") == 0) {
 
@@ -1175,7 +1281,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			else
 				appctx->ctx.map.display_flags = PAT_REF_ACL;
 
-			/* no parameter: display all map avalaible */
+			/* no parameter: display all map available */
 			if (!*args[2]) {
 				appctx->st2 = STAT_ST_INIT;
 				appctx->st0 = STAT_CLI_O_PATS;
@@ -1211,8 +1317,8 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				clrall = 1;
 
 			/* check permissions */
-			if (s->listener->bind_conf->level < ACCESS_LVL_OPER ||
-			    (clrall && s->listener->bind_conf->level < ACCESS_LVL_ADMIN)) {
+			if (strm_li(s)->bind_conf->level < ACCESS_LVL_OPER ||
+			    (clrall && strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN)) {
 				appctx->ctx.cli.msg = stats_permission_denied_msg;
 				appctx->st0 = STAT_CLI_PRINT;
 				return 1;
@@ -1331,7 +1437,9 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 
 			/* return server's effective weight at the moment */
 			snprintf(trash.str, trash.size, "%d (initial %d)\n", sv->uweight, sv->iweight);
-			bi_putstr(si->ib, trash.str);
+			if (bi_putstr(si_ic(si), trash.str) == -1)
+				si_applet_cant_put(si);
+
 			return 1;
 		}
 		else if (strcmp(args[1], "map") == 0 || strcmp(args[1], "acl") == 0) {
@@ -1466,8 +1574,15 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 					appctx->st0 = STAT_CLI_PRINT;
 				}
 			}
+			else if (strcmp(args[3], "addr") == 0) {
+				warning = server_parse_addr_change_request(sv, args[4]);
+				if (warning) {
+					appctx->ctx.cli.msg = warning;
+					appctx->st0 = STAT_CLI_PRINT;
+				}
+			}
 			else {
-				appctx->ctx.cli.msg = "'set server <srv>' only supports 'agent', 'health', 'state' and 'weight'.\n";
+				appctx->ctx.cli.msg = "'set server <srv>' only supports 'agent', 'health', 'state', 'weight' and 'addr'.\n";
 				appctx->st0 = STAT_CLI_PRINT;
 			}
 			return 1;
@@ -1490,7 +1605,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 					return 1;
 				}
 
-				s->req->rto = s->rep->wto = 1 + MS_TO_TICKS(timeout*1000);
+				s->req.rto = s->res.wto = 1 + MS_TO_TICKS(timeout*1000);
 				return 1;
 			}
 			else {
@@ -1532,15 +1647,15 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 						resume_listener(l);
 				}
 
-				if (px->maxconn > px->feconn && !LIST_ISEMPTY(&s->fe->listener_queue))
-					dequeue_all_listeners(&s->fe->listener_queue);
+				if (px->maxconn > px->feconn && !LIST_ISEMPTY(&strm_fe(s)->listener_queue))
+					dequeue_all_listeners(&strm_fe(s)->listener_queue);
 
 				return 1;
 			}
 			else if (strcmp(args[2], "global") == 0) {
 				int v;
 
-				if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+				if (strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN) {
 					appctx->ctx.cli.msg = stats_permission_denied_msg;
 					appctx->st0 = STAT_CLI_PRINT;
 					return 1;
@@ -1582,7 +1697,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				if (strcmp(args[3], "global") == 0) {
 					int v;
 
-					if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+					if (strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN) {
 						appctx->ctx.cli.msg = stats_permission_denied_msg;
 						appctx->st0 = STAT_CLI_PRINT;
 						return 1;
@@ -1619,7 +1734,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				if (strcmp(args[3], "global") == 0) {
 					int v;
 
-					if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+					if (strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN) {
 						appctx->ctx.cli.msg = stats_permission_denied_msg;
 						appctx->st0 = STAT_CLI_PRINT;
 						return 1;
@@ -1657,7 +1772,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				if (strcmp(args[3], "global") == 0) {
 					int v;
 
-					if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+					if (strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN) {
 						appctx->ctx.cli.msg = stats_permission_denied_msg;
 						appctx->st0 = STAT_CLI_PRINT;
 						return 1;
@@ -1694,6 +1809,12 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			else if (strcmp(args[2], "http-compression") == 0) {
 				if (strcmp(args[3], "global") == 0) {
 					int v;
+
+					if (strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN) {
+						appctx->ctx.cli.msg = stats_permission_denied_msg;
+						appctx->st0 = STAT_CLI_PRINT;
+						return 1;
+					}
 
 					if (!*args[4]) {
 						appctx->ctx.cli.msg = "Expects a maximum input byte rate in kB/s.\n";
@@ -1795,7 +1916,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 #ifdef USE_OPENSSL
 		else if (strcmp(args[1], "ssl") == 0) {
 			if (strcmp(args[2], "ocsp-response") == 0) {
-#ifdef SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB
+#if (defined SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB && !defined OPENSSL_NO_OCSP)
 				char *err = NULL;
 
 				/* Expect one parameter: the new response in base64 encoding */
@@ -1825,6 +1946,42 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				return 1;
 #else
 				appctx->ctx.cli.msg = "HAProxy was compiled against a version of OpenSSL that doesn't support OCSP stapling.\n";
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+#endif
+			}
+			else if (strcmp(args[2], "tls-key") == 0) {
+#if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
+				/* Expect two parameters: the filename and the new new TLS key in encoding */
+				if (!*args[3] || !*args[4]) {
+					appctx->ctx.cli.msg = "'set ssl tls-key' expects a filename and the new TLS key in base64 encoding.\n";
+					appctx->st0 = STAT_CLI_PRINT;
+					return 1;
+				}
+
+				appctx->ctx.tlskeys.ref = tlskeys_ref_lookup_ref(args[3]);
+				if(!appctx->ctx.tlskeys.ref) {
+					appctx->ctx.cli.msg = "'set ssl tls-key' unable to locate referenced filename\n";
+					appctx->st0 = STAT_CLI_PRINT;
+					return 1;
+				}
+
+				trash.len = base64dec(args[4], strlen(args[4]), trash.str, trash.size);
+				if (trash.len != sizeof(struct tls_sess_key)) {
+					appctx->ctx.cli.msg = "'set ssl tls-key' received invalid base64 encoded TLS key.\n";
+					appctx->st0 = STAT_CLI_PRINT;
+					return 1;
+				}
+
+				memcpy(appctx->ctx.tlskeys.ref->tlskeys + ((appctx->ctx.tlskeys.ref->tls_ticket_enc_index + 2) % TLS_TICKETS_NO), trash.str, trash.len);
+				appctx->ctx.tlskeys.ref->tls_ticket_enc_index = (appctx->ctx.tlskeys.ref->tls_ticket_enc_index + 1) % TLS_TICKETS_NO;
+
+				appctx->ctx.cli.msg = "TLS ticket key updated!";
+				appctx->st0 = STAT_CLI_PRINT;
+				return 1;
+#else
+				appctx->ctx.cli.msg = "HAProxy was compiled against a version of OpenSSL "
+							"that doesn't support specifying TLS ticket keys\n";
 				appctx->st0 = STAT_CLI_PRINT;
 				return 1;
 #endif
@@ -2000,9 +2157,9 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			return 1;
 		}
 		else if (strcmp(args[1], "session") == 0) {
-			struct session *sess, *ptr;
+			struct stream *sess, *ptr;
 
-			if (s->listener->bind_conf->level < ACCESS_LVL_ADMIN) {
+			if (strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN) {
 				appctx->ctx.cli.msg = stats_permission_denied_msg;
 				appctx->st0 = STAT_CLI_PRINT;
 				return 1;
@@ -2016,35 +2173,35 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 
 			ptr = (void *)strtoul(args[2], NULL, 0);
 
-			/* first, look for the requested session in the session table */
-			list_for_each_entry(sess, &sessions, list) {
+			/* first, look for the requested stream in the stream table */
+			list_for_each_entry(sess, &streams, list) {
 				if (sess == ptr)
 					break;
 			}
 
-			/* do we have the session ? */
+			/* do we have the stream ? */
 			if (sess != ptr) {
 				appctx->ctx.cli.msg = "No such session (use 'show sess').\n";
 				appctx->st0 = STAT_CLI_PRINT;
 				return 1;
 			}
 
-			session_shutdown(sess, SN_ERR_KILLED);
+			stream_shutdown(sess, SF_ERR_KILLED);
 			return 1;
 		}
 		else if (strcmp(args[1], "sessions") == 0) {
 			if (strcmp(args[2], "server") == 0) {
 				struct server *sv;
-				struct session *sess, *sess_bck;
+				struct stream *sess, *sess_bck;
 
 				sv = expect_server_admin(s, si, args[3]);
 				if (!sv)
 					return 1;
 
-				/* kill all the session that are on this server */
+				/* kill all the stream that are on this server */
 				list_for_each_entry_safe(sess, sess_bck, &sv->actconns, by_srv)
 					if (sess->srv_conn == sv)
-						session_shutdown(sess, SN_ERR_KILLED);
+						stream_shutdown(sess, SF_ERR_KILLED);
 
 				return 1;
 			}
@@ -2237,11 +2394,11 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
  * STAT_CLI_* constants. appctx->st1 is used to indicate whether prompt is enabled
  * or not.
  */
-static void cli_io_handler(struct stream_interface *si)
+static void cli_io_handler(struct appctx *appctx)
 {
-	struct appctx *appctx = __objt_appctx(si->end);
-	struct channel *req = si->ob;
-	struct channel *res = si->ib;
+	struct stream_interface *si = appctx->owner;
+	struct channel *req = si_oc(si);
+	struct channel *res = si_ic(si);
 	int reql;
 	int len;
 
@@ -2265,12 +2422,12 @@ static void cli_io_handler(struct stream_interface *si)
 			/* ensure we have some output room left in the event we
 			 * would want to return some info right after parsing.
 			 */
-			if (buffer_almost_full(si->ib->buf)) {
-				si->ib->flags |= CF_WAKE_WRITE;
+			if (buffer_almost_full(si_ib(si))) {
+				si_applet_cant_put(si);
 				break;
 			}
 
-			reql = bo_getline(si->ob, trash.str, trash.size);
+			reql = bo_getline(si_oc(si), trash.str, trash.size);
 			if (reql <= 0) { /* closed or EOL not found */
 				if (reql == 0)
 					break;
@@ -2330,33 +2487,45 @@ static void cli_io_handler(struct stream_interface *si)
 			}
 
 			/* re-adjust req buffer */
-			bo_skip(si->ob, reql);
+			bo_skip(si_oc(si), reql);
 			req->flags |= CF_READ_DONTWAIT; /* we plan to read small requests */
 		}
-		else {	/* output functions: first check if the output buffer is closed then abort */
-			if (res->flags & (CF_SHUTR_NOW|CF_SHUTR)) {
-				cli_release_handler(si);
-				appctx->st0 = STAT_CLI_END;
-				continue;
-			}
-
+		else {	/* output functions */
 			switch (appctx->st0) {
+			case STAT_CLI_PROMPT:
+				break;
 			case STAT_CLI_PRINT:
-				if (bi_putstr(si->ib, appctx->ctx.cli.msg) != -1)
+				if (bi_putstr(si_ic(si), appctx->ctx.cli.msg) != -1)
 					appctx->st0 = STAT_CLI_PROMPT;
+				else
+					si_applet_cant_put(si);
 				break;
 			case STAT_CLI_PRINT_FREE:
-				if (bi_putstr(si->ib, appctx->ctx.cli.err) != -1) {
+				if (bi_putstr(si_ic(si), appctx->ctx.cli.err) != -1) {
 					free(appctx->ctx.cli.err);
 					appctx->st0 = STAT_CLI_PROMPT;
 				}
+				else
+					si_applet_cant_put(si);
+				break;
+			case STAT_CLI_O_BACKEND:
+				if (stats_dump_backend_to_buffer(si))
+					appctx->st0 = STAT_CLI_PROMPT;
 				break;
 			case STAT_CLI_O_INFO:
 				if (stats_dump_info_to_buffer(si))
 					appctx->st0 = STAT_CLI_PROMPT;
 				break;
+			case STAT_CLI_O_SERVERS_STATE:
+				if (stats_dump_servers_state_to_buffer(si))
+					appctx->st0 = STAT_CLI_PROMPT;
+				break;
 			case STAT_CLI_O_STAT:
 				if (stats_dump_stat_to_buffer(si, NULL))
+					appctx->st0 = STAT_CLI_PROMPT;
+				break;
+			case STAT_CLI_O_RESOLVERS:
+				if (stats_dump_resolvers_to_buffer(si))
 					appctx->st0 = STAT_CLI_PROMPT;
 				break;
 			case STAT_CLI_O_SESS:
@@ -2388,16 +2557,23 @@ static void cli_io_handler(struct stream_interface *si)
 				if (stats_dump_pools_to_buffer(si))
 					appctx->st0 = STAT_CLI_PROMPT;
 				break;
+#if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
+			case STAT_CLI_O_TLSK:
+				if (stats_tlskeys_list(si))
+					appctx->st0 = STAT_CLI_PROMPT;
+				break;
+#endif
 			default: /* abnormal state */
-				cli_release_handler(si);
-				appctx->st0 = STAT_CLI_PROMPT;
+				si->flags |= SI_FL_ERR;
 				break;
 			}
 
 			/* The post-command prompt is either LF alone or LF + '> ' in interactive mode */
 			if (appctx->st0 == STAT_CLI_PROMPT) {
-				if (bi_putstr(si->ib, appctx->st1 ? "\n> " : "\n") != -1)
+				if (bi_putstr(si_ic(si), appctx->st1 ? "\n> " : "\n") != -1)
 					appctx->st0 = STAT_CLI_GETREQ;
+				else
+					si_applet_cant_put(si);
 			}
 
 			/* If the output functions are still there, it means they require more room. */
@@ -2419,7 +2595,7 @@ static void cli_io_handler(struct stream_interface *si)
 		}
 	}
 
-	if ((res->flags & CF_SHUTR) && (si->state == SI_ST_EST) && (appctx->st0 != STAT_CLI_GETREQ)) {
+	if ((res->flags & CF_SHUTR) && (si->state == SI_ST_EST)) {
 		DPRINTF(stderr, "%s@%d: si to buf closed. req=%08x, res=%08x, st=%d\n",
 			__FUNCTION__, __LINE__, req->flags, res->flags, si->state);
 		/* Other side has closed, let's abort if we have no more processing to do
@@ -2441,22 +2617,10 @@ static void cli_io_handler(struct stream_interface *si)
 		res->flags |= CF_READ_NULL;
 	}
 
-	/* update all other flags and resync with the other side */
-	si_update(si);
-
-	/* we don't want to expire timeouts while we're processing requests */
-	si->ib->rex = TICK_ETERNITY;
-	si->ob->wex = TICK_ETERNITY;
-
  out:
 	DPRINTF(stderr, "%s@%d: st=%d, rqf=%x, rpf=%x, rqh=%d, rqs=%d, rh=%d, rs=%d\n",
 		__FUNCTION__, __LINE__,
 		si->state, req->flags, res->flags, req->buf->i, req->buf->o, res->buf->i, res->buf->o);
-
-	if (unlikely(si->state == SI_ST_DIS || si->state == SI_ST_CLO)) {
-		/* check that we have released everything then unregister */
-		stream_int_unregister_handler(si);
-	}
 }
 
 /* This function dumps information onto the stream interface's read buffer.
@@ -2565,8 +2729,158 @@ static int stats_dump_info_to_buffer(struct stream_interface *si)
 	             global.node, global.desc ? global.desc : ""
 	             );
 
-	if (bi_putchk(si->ib, &trash) == -1)
+	if (bi_putchk(si_ic(si), &trash) == -1) {
+		si_applet_cant_put(si);
 		return 0;
+	}
+
+	return 1;
+}
+
+/* dumps server state information into <buf> for all the servers found in <backend>
+ * These information are all the parameters which may change during HAProxy runtime.
+ * By default, we only export to the last known server state file format.
+ * These information can be used at next startup to recover same level of server state.
+ */
+static int dump_servers_state(struct stream_interface *si, struct chunk *buf)
+{
+	struct appctx *appctx = __objt_appctx(si->end);
+	struct server *srv;
+	char srv_addr[INET6_ADDRSTRLEN + 1];
+	time_t srv_time_since_last_change;
+	int bk_f_forced_id, srv_f_forced_id;
+
+
+	/* we don't want to report any state if the backend is not enabled on this process */
+	if (appctx->ctx.server_state.px->bind_proc && !(appctx->ctx.server_state.px->bind_proc & (1UL << (relative_pid - 1))))
+		return 1;
+
+	if (!appctx->ctx.server_state.sv)
+		appctx->ctx.server_state.sv = appctx->ctx.server_state.px->srv;
+
+	for (; appctx->ctx.server_state.sv != NULL; appctx->ctx.server_state.sv = srv->next) {
+		srv = appctx->ctx.server_state.sv;
+		srv_addr[0] = '\0';
+		srv_time_since_last_change = 0;
+		bk_f_forced_id = 0;
+		srv_f_forced_id = 0;
+
+		switch (srv->addr.ss_family) {
+			case AF_INET:
+				inet_ntop(srv->addr.ss_family, &((struct sockaddr_in *)&srv->addr)->sin_addr,
+					  srv_addr, INET_ADDRSTRLEN + 1);
+				break;
+			case AF_INET6:
+				inet_ntop(srv->addr.ss_family, &((struct sockaddr_in6 *)&srv->addr)->sin6_addr,
+					  srv_addr, INET6_ADDRSTRLEN + 1);
+				break;
+		}
+		srv_time_since_last_change = now.tv_sec - srv->last_change;
+		bk_f_forced_id = appctx->ctx.server_state.px->options & PR_O_FORCED_ID ? 1 : 0;
+		srv_f_forced_id = srv->flags & SRV_F_FORCED_ID ? 1 : 0;
+
+		chunk_appendf(buf,
+				"%d %s "
+				"%d %s %s "
+				"%d %d %d %d %ld "
+				"%d %d %d %d %d "
+				"%d %d"
+				"\n",
+				appctx->ctx.server_state.px->uuid, appctx->ctx.server_state.px->id,
+				srv->puid, srv->id, srv_addr,
+				srv->state, srv->admin, srv->uweight, srv->iweight, (long int)srv_time_since_last_change,
+				srv->check.status, srv->check.result, srv->check.health, srv->check.state, srv->agent.state,
+				bk_f_forced_id, srv_f_forced_id);
+		if (bi_putchk(si_ic(si), &trash) == -1) {
+			si_applet_cant_put(si);
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* Parses backend list and simply report backend names */
+static int stats_dump_backend_to_buffer(struct stream_interface *si)
+{
+	struct appctx *appctx = __objt_appctx(si->end);
+	extern struct proxy *proxy;
+	struct proxy *curproxy;
+
+	chunk_reset(&trash);
+
+	if (!appctx->ctx.be.px) {
+		chunk_printf(&trash, "# name\n");
+		if (bi_putchk(si_ic(si), &trash) == -1) {
+			si_applet_cant_put(si);
+			return 0;
+		}
+		appctx->ctx.be.px = proxy;
+	}
+
+	for (; appctx->ctx.be.px != NULL; appctx->ctx.be.px = curproxy->next) {
+		curproxy = appctx->ctx.be.px;
+
+		/* looking for backends only */
+		if (!(curproxy->cap & PR_CAP_BE))
+			continue;
+
+		/* we don't want to list a backend which is bound to this process */
+		if (curproxy->bind_proc && !(curproxy->bind_proc & (1UL << (relative_pid - 1))))
+			continue;
+
+		chunk_appendf(&trash, "%s\n", curproxy->id);
+		if (bi_putchk(si_ic(si), &trash) == -1) {
+			si_applet_cant_put(si);
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+/* Parses backend list or simply use backend name provided by the user to return
+ * states of servers to stdout.
+ */
+static int stats_dump_servers_state_to_buffer(struct stream_interface *si)
+{
+	struct appctx *appctx = __objt_appctx(si->end);
+	extern struct proxy *proxy;
+	struct proxy *curproxy;
+
+	chunk_reset(&trash);
+
+	if (appctx->st2 == STAT_ST_INIT) {
+		if (!appctx->ctx.server_state.px)
+			appctx->ctx.server_state.px = proxy;
+		appctx->st2 = STAT_ST_HEAD;
+	}
+
+	if (appctx->st2 == STAT_ST_HEAD) {
+		chunk_printf(&trash, "%d\n# %s\n", SRV_STATE_FILE_VERSION, SRV_STATE_FILE_FIELD_NAMES);
+		if (bi_putchk(si_ic(si), &trash) == -1) {
+			si_applet_cant_put(si);
+			return 0;
+		}
+		appctx->st2 = STAT_ST_INFO;
+	}
+
+	/* STAT_ST_INFO */
+	for (; appctx->ctx.server_state.px != NULL; appctx->ctx.server_state.px = curproxy->next) {
+		curproxy = appctx->ctx.server_state.px;
+		/* servers are only in backends */
+		if (curproxy->cap & PR_CAP_BE) {
+			if (!dump_servers_state(si, &trash))
+				return 0;
+
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				si_applet_cant_put(si);
+				return 0;
+			}
+		}
+		/* only the selected proxy is dumped */
+		if (appctx->ctx.server_state.iid)
+			break;
+	}
 
 	return 1;
 }
@@ -2578,8 +2892,10 @@ static int stats_dump_info_to_buffer(struct stream_interface *si)
 static int stats_dump_pools_to_buffer(struct stream_interface *si)
 {
 	dump_pools_to_trash();
-	if (bi_putchk(si->ib, &trash) == -1)
+	if (bi_putchk(si_ic(si), &trash) == -1) {
+		si_applet_cant_put(si);
 		return 0;
+	}
 	return 1;
 }
 
@@ -2702,12 +3018,22 @@ static int stats_dump_fe_stats(struct stream_interface *si, struct proxy *px)
 
 		chunk_appendf(&trash,
 			      /* bytes:out + compression stats (via hover): comp_in, comp_out, comp_byp */
-		              "<td>%s%s<div class=tips>compression: in=%lld out=%lld bypassed=%lld savings=%d%%</div>%s</td>",
+		              "<td>%s%s<div class=tips><table class=det>"
+			      "<tr><th>Response bytes in:</th><td>%s</td></tr>"
+			      "<tr><th>Compression in:</th><td>%s</td></tr>"
+			      "<tr><th>Compression out:</th><td>%s</td><td>(%d%%)</td></tr>"
+			      "<tr><th>Compression bypass:</th><td>%s</td></tr>"
+			      "<tr><th>Total bytes saved:</th><td>%s</td><td>(%d%%)</td></tr>"
+			      "</table></div>%s</td>",
 		              (px->fe_counters.comp_in || px->fe_counters.comp_byp) ? "<u>":"",
 		              U2H(px->fe_counters.bytes_out),
-		              px->fe_counters.comp_in, px->fe_counters.comp_out, px->fe_counters.comp_byp,
-		              px->fe_counters.comp_in ?
-		              (int)((px->fe_counters.comp_in - px->fe_counters.comp_out)*100/px->fe_counters.comp_in) : 0,
+		              U2H(px->fe_counters.bytes_out),
+		              U2H(px->fe_counters.comp_in),
+			      U2H(px->fe_counters.comp_out),
+			      px->fe_counters.comp_in ? (int)(px->fe_counters.comp_out * 100 / px->fe_counters.comp_in) : 0,
+			      U2H(px->fe_counters.comp_byp),
+			      U2H(px->fe_counters.comp_in - px->fe_counters.comp_out),
+			      px->fe_counters.bytes_out ? (int)((px->fe_counters.comp_in - px->fe_counters.comp_out) * 100 / px->fe_counters.bytes_out) : 0,
 		              (px->fe_counters.comp_in || px->fe_counters.comp_byp) ? "</u>":"");
 
 		chunk_appendf(&trash,
@@ -2929,14 +3255,51 @@ static int stats_dump_li_stats(struct stream_interface *si, struct proxy *px, st
 	return 1;
 }
 
+enum srv_stats_state {
+	SRV_STATS_STATE_DOWN = 0,
+	SRV_STATS_STATE_DOWN_AGENT,
+	SRV_STATS_STATE_GOING_UP,
+	SRV_STATS_STATE_UP_GOING_DOWN,
+	SRV_STATS_STATE_UP,
+	SRV_STATS_STATE_NOLB_GOING_DOWN,
+	SRV_STATS_STATE_NOLB,
+	SRV_STATS_STATE_DRAIN_GOING_DOWN,
+	SRV_STATS_STATE_DRAIN,
+	SRV_STATS_STATE_DRAIN_AGENT,
+	SRV_STATS_STATE_NO_CHECK,
+
+	SRV_STATS_STATE_COUNT, /* Must be last */
+};
+
+enum srv_stats_colour {
+	SRV_STATS_COLOUR_DOWN = 0,
+	SRV_STATS_COLOUR_GOING_UP,
+	SRV_STATS_COLOUR_GOING_DOWN,
+	SRV_STATS_COLOUR_UP,
+	SRV_STATS_COLOUR_NOLB,
+	SRV_STATS_COLOUR_DRAINING,
+	SRV_STATS_COLOUR_NO_CHECK,
+
+	SRV_STATS_COLOUR_COUNT, /* Must be last */
+};
+
+static const char *srv_stats_colour_st[SRV_STATS_COLOUR_COUNT] = {
+	[SRV_STATS_COLOUR_DOWN]		= "down",
+	[SRV_STATS_COLOUR_GOING_UP]	= "going_up",
+	[SRV_STATS_COLOUR_GOING_DOWN]	= "going_down",
+	[SRV_STATS_COLOUR_UP]		= "up",
+	[SRV_STATS_COLOUR_NOLB]		= "nolb",
+	[SRV_STATS_COLOUR_DRAINING]	= "draining",
+	[SRV_STATS_COLOUR_NO_CHECK]	= "no_check",
+};
+
 /* Dumps a line for server <sv> and proxy <px> to the trash and uses the state
  * from stream interface <si>, stats flags <flags>, and server state <state>.
  * The caller is responsible for clearing the trash if needed. Returns non-zero
- * if it emits anything, zero otherwise. The <state> parameter can take the
- * following values : 0=DOWN, 1=DOWN(agent) 2=going up, 3=going down, 4=UP, 5,6=NOLB,
- * 7,8=DRAIN, 9=unchecked.
+ * if it emits anything, zero otherwise.
  */
-static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, int flags, struct server *sv, int state)
+static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, int flags, struct server *sv,
+			       enum srv_stats_state state, enum srv_stats_colour colour)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
 	struct server *via, *ref;
@@ -2953,25 +3316,26 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 		ref = ref->track;
 
 	if (appctx->ctx.stats.flags & STAT_FMT_HTML) {
-		static char *srv_hlt_st[10] = {
-			"DOWN",
-			"DOWN (agent)",
-			"DN %d/%d &uarr;",
-			"UP %d/%d &darr;",
-			"UP",
-			"NOLB %d/%d &darr;",
-			"NOLB",
-			"DRAIN %d/%d &darr;",
-			"DRAIN",
-			"<i>no check</i>"
+		static char *srv_hlt_st[SRV_STATS_STATE_COUNT] = {
+			[SRV_STATS_STATE_DOWN]			= "DOWN",
+			[SRV_STATS_STATE_DOWN_AGENT]		= "DOWN (agent)",
+			[SRV_STATS_STATE_GOING_UP]		= "DN %d/%d &uarr;",
+			[SRV_STATS_STATE_UP_GOING_DOWN]		= "UP %d/%d &darr;",
+			[SRV_STATS_STATE_UP]			= "UP",
+			[SRV_STATS_STATE_NOLB_GOING_DOWN]	= "NOLB %d/%d &darr;",
+			[SRV_STATS_STATE_NOLB]			= "NOLB",
+			[SRV_STATS_STATE_DRAIN_GOING_DOWN]	= "DRAIN %d/%d &darr;",
+			[SRV_STATS_STATE_DRAIN]			= "DRAIN",
+			[SRV_STATS_STATE_DRAIN_AGENT]		= "DRAIN (agent)",
+			[SRV_STATS_STATE_NO_CHECK]		= "<i>no check</i>",
 		};
 
 		if (sv->admin & SRV_ADMF_MAINT)
 			chunk_appendf(&trash, "<tr class=\"maintain\">");
 		else
 			chunk_appendf(&trash,
-			              "<tr class=\"%s%d\">",
-			              (sv->flags & SRV_F_BACKUP) ? "backup" : "active", state);
+			              "<tr class=\"%s_%s\">",
+			              (sv->flags & SRV_F_BACKUP) ? "backup" : "active", srv_stats_colour_st[colour]);
 
 		if ((px->cap & PR_CAP_BE) && px->srv && (appctx->ctx.stats.flags & STAT_ADMIN))
 			chunk_appendf(&trash,
@@ -3207,17 +3571,19 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 			chunk_appendf(&trash, "<td class=ac>-</td></tr>\n");
 	}
 	else { /* CSV mode */
-		static char *srv_hlt_st[10] = {
-			"DOWN,",
-			"DOWN (agent),",
-			"DOWN %d/%d,",
-			"UP %d/%d,",
-			"UP,",
-			"NOLB %d/%d,",
-			"NOLB,",
-			"DRAIN %d/%d,",
-			"DRAIN,",
-			"no check,"
+		struct chunk *out = get_trash_chunk();
+		static char *srv_hlt_st[SRV_STATS_STATE_COUNT] = {
+			[SRV_STATS_STATE_DOWN]			= "DOWN,",
+			[SRV_STATS_STATE_DOWN_AGENT]		= "DOWN (agent),",
+			[SRV_STATS_STATE_GOING_UP]		= "DOWN %d/%d,",
+			[SRV_STATS_STATE_UP_GOING_DOWN]		= "UP %d/%d,",
+			[SRV_STATS_STATE_UP]			= "UP,",
+			[SRV_STATS_STATE_NOLB_GOING_DOWN]	= "NOLB %d/%d,",
+			[SRV_STATS_STATE_NOLB]			= "NOLB,",
+			[SRV_STATS_STATE_DRAIN_GOING_DOWN]	= "DRAIN %d/%d,",
+			[SRV_STATS_STATE_DRAIN]			= "DRAIN,",
+			[SRV_STATS_STATE_DRAIN_AGENT]		= "DRAIN (agent),",
+			[SRV_STATS_STATE_NO_CHECK]		= "no check,"
 		};
 
 		chunk_appendf(&trash,
@@ -3303,7 +3669,7 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 
 		if (sv->check.state & CHK_ST_ENABLED) {
 			/* check_status */
-			chunk_appendf(&trash, "%s,", get_check_status_info(sv->check.status));
+			chunk_appendf(&trash, "%s,", csv_enc(get_check_status_info(sv->check.status), 1, out));
 
 			/* check_code */
 			if (sv->check.status >= HCHK_STATUS_L57DATA)
@@ -3348,8 +3714,8 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 		chunk_appendf(&trash, "%d,", srv_lastsession(sv));
 
 		/* capture of last check and agent statuses */
-		chunk_appendf(&trash, "%s,", ((sv->check.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) ? cstr(sv->check.desc) : "");
-		chunk_appendf(&trash, "%s,", ((sv->agent.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) ? cstr(sv->agent.desc) : "");
+		chunk_appendf(&trash, "%s,", ((sv->check.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) ? csv_enc(cstr(sv->check.desc), 1, out) : "");
+		chunk_appendf(&trash, "%s,", ((sv->agent.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) ? csv_enc(cstr(sv->agent.desc), 1, out) : "");
 
 		/* qtime, ctime, rtime, ttime, */
 		chunk_appendf(&trash, "%u,%u,%u,%u,",
@@ -3477,12 +3843,22 @@ static int stats_dump_be_stats(struct stream_interface *si, struct proxy *px, in
 
 		chunk_appendf(&trash,
 			      /* bytes:out + compression stats (via hover): comp_in, comp_out, comp_byp */
-		              "<td>%s%s<div class=tips>compression: in=%lld out=%lld bypassed=%lld savings=%d%%</div>%s</td>",
+		              "<td>%s%s<div class=tips><table class=det>"
+			      "<tr><th>Response bytes in:</th><td>%s</td></tr>"
+			      "<tr><th>Compression in:</th><td>%s</td></tr>"
+			      "<tr><th>Compression out:</th><td>%s</td><td>(%d%%)</td></tr>"
+			      "<tr><th>Compression bypass:</th><td>%s</td></tr>"
+			      "<tr><th>Total bytes saved:</th><td>%s</td><td>(%d%%)</td></tr>"
+			      "</table></div>%s</td>",
 		              (px->be_counters.comp_in || px->be_counters.comp_byp) ? "<u>":"",
 		              U2H(px->be_counters.bytes_out),
-		              px->be_counters.comp_in, px->be_counters.comp_out, px->be_counters.comp_byp,
-		              px->be_counters.comp_in ?
-		              (int)((px->be_counters.comp_in - px->be_counters.comp_out)*100/px->be_counters.comp_in) : 0,
+		              U2H(px->be_counters.bytes_out),
+		              U2H(px->be_counters.comp_in),
+			      U2H(px->be_counters.comp_out),
+			      px->be_counters.comp_in ? (int)(px->be_counters.comp_out * 100 / px->be_counters.comp_in) : 0,
+			      U2H(px->be_counters.comp_byp),
+			      U2H(px->be_counters.comp_in - px->be_counters.comp_out),
+			      px->be_counters.bytes_out ? (int)((px->be_counters.comp_in - px->be_counters.comp_out) * 100 / px->be_counters.bytes_out) : 0,
 		              (px->be_counters.comp_in || px->be_counters.comp_byp) ? "</u>":"");
 
 		chunk_appendf(&trash,
@@ -3627,16 +4003,12 @@ static void stats_dump_html_px_hdr(struct stream_interface *si, struct proxy *px
 		scope_txt[0] = 0;
 		if (appctx->ctx.stats.scope_len) {
 			strcpy(scope_txt, STAT_SCOPE_PATTERN);
-			memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si->ob->buf) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
+			memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
 			scope_txt[strlen(STAT_SCOPE_PATTERN) + appctx->ctx.stats.scope_len] = 0;
 		}
 
 		chunk_appendf(&trash,
-			      "<form action=\"%s%s%s%s\" method=\"post\">",
-			      uri->uri_prefix,
-			      (appctx->ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
-			      (appctx->ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
-			      scope_txt);
+			      "<form method=\"post\">");
 	}
 
 	/* print a new table */
@@ -3742,8 +4114,8 @@ static void stats_dump_html_px_end(struct stream_interface *si, struct proxy *px
 static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, struct uri_auth *uri)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
-	struct session *s = session_from_task(si->owner);
-	struct channel *rep = si->ib;
+	struct stream *s = si_strm(si);
+	struct channel *rep = si_ic(si);
 	struct server *sv, *svs;	/* server and server-state, server-state=server or server->track */
 	struct listener *l;
 
@@ -3780,7 +4152,7 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 		 * name does not match, skip it.
 		 */
 		if (appctx->ctx.stats.scope_len &&
-		    strnistr(px->id, strlen(px->id), bo_ptr(si->ob->buf) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len) == NULL)
+		    strnistr(px->id, strlen(px->id), bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len) == NULL)
 			return 1;
 
 		if ((appctx->ctx.stats.flags & STAT_BOUND) &&
@@ -3794,8 +4166,10 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 	case STAT_PX_ST_TH:
 		if (appctx->ctx.stats.flags & STAT_FMT_HTML) {
 			stats_dump_html_px_hdr(si, px, uri);
-			if (bi_putchk(rep, &trash) == -1)
+			if (bi_putchk(rep, &trash) == -1) {
+				si_applet_cant_put(si);
 				return 0;
+			}
 		}
 
 		appctx->ctx.stats.px_st = STAT_PX_ST_FE;
@@ -3803,9 +4177,12 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 
 	case STAT_PX_ST_FE:
 		/* print the frontend */
-		if (stats_dump_fe_stats(si, px))
-			if (bi_putchk(rep, &trash) == -1)
+		if (stats_dump_fe_stats(si, px)) {
+			if (bi_putchk(rep, &trash) == -1) {
+				si_applet_cant_put(si);
 				return 0;
+			}
+		}
 
 		appctx->ctx.stats.l = px->conf.listeners.n;
 		appctx->ctx.stats.px_st = STAT_PX_ST_LI;
@@ -3815,7 +4192,7 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 		/* stats.l has been initialized above */
 		for (; appctx->ctx.stats.l != &px->conf.listeners; appctx->ctx.stats.l = l->by_fe.n) {
 			if (buffer_almost_full(rep->buf)) {
-				rep->flags |= CF_WAKE_WRITE;
+				si_applet_cant_put(si);
 				return 0;
 			}
 
@@ -3832,9 +4209,12 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 			}
 
 			/* print the frontend */
-			if (stats_dump_li_stats(si, px, l, uri ? uri->flags : 0))
-				if (bi_putchk(rep, &trash) == -1)
+			if (stats_dump_li_stats(si, px, l, uri ? uri->flags : 0)) {
+				if (bi_putchk(rep, &trash) == -1) {
+					si_applet_cant_put(si);
 					return 0;
+				}
+			}
 		}
 
 		appctx->ctx.stats.sv = px->srv; /* may be NULL */
@@ -3844,10 +4224,11 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 	case STAT_PX_ST_SV:
 		/* stats.sv has been initialized above */
 		for (; appctx->ctx.stats.sv != NULL; appctx->ctx.stats.sv = sv->next) {
-			int sv_state;
+			enum srv_stats_state sv_state;
+			enum srv_stats_colour sv_colour;
 
 			if (buffer_almost_full(rep->buf)) {
-				rep->flags |= CF_WAKE_WRITE;
+				si_applet_cant_put(si);
 				return 0;
 			}
 
@@ -3866,42 +4247,56 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 				svs = svs->track;
 
 			if (sv->state == SRV_ST_RUNNING || sv->state == SRV_ST_STARTING) {
-				/* server is UP. The possibilities are :
-				 *   - UP, draining, going down    => state = 7
-				 *   - UP, going down              => state = 3
-				 *   - UP, draining                => state = 8
-				 *   - UP, checked                 => state = 4
-				 *   - UP, not checked nor tracked => state = 9
-				 */
-
 				if ((svs->check.state & CHK_ST_ENABLED) &&
-				    (svs->check.health < svs->check.rise + svs->check.fall - 1))
-					sv_state = 3;
-				else
-					sv_state = 4;
+				    (svs->check.health < svs->check.rise + svs->check.fall - 1)) {
+					sv_state = SRV_STATS_STATE_UP_GOING_DOWN;
+					sv_colour = SRV_STATS_COLOUR_GOING_DOWN;
+				} else {
+					sv_state = SRV_STATS_STATE_UP;
+					sv_colour = SRV_STATS_COLOUR_UP;
+				}
 
-				if (server_is_draining(sv))
-					sv_state += 4;
+				if (sv_state == SRV_STATS_STATE_UP && !svs->uweight)
+					sv_colour = SRV_STATS_COLOUR_DRAINING;
 
-				if (sv_state == 4 && !(svs->check.state & CHK_ST_ENABLED))
-					sv_state = 9; /* unchecked UP */
+				if (sv->admin & SRV_ADMF_DRAIN) {
+					if (svs->agent.state & CHK_ST_ENABLED)
+						sv_state = SRV_STATS_STATE_DRAIN_AGENT;
+					else if (sv_state == SRV_STATS_STATE_UP_GOING_DOWN)
+						sv_state = SRV_STATS_STATE_DRAIN_GOING_DOWN;
+					else
+						sv_state = SRV_STATS_STATE_DRAIN;
+				}
+
+				if (sv_state == SRV_STATS_STATE_UP && !(svs->check.state & CHK_ST_ENABLED)) {
+					sv_state = SRV_STATS_STATE_NO_CHECK;
+					sv_colour = SRV_STATS_COLOUR_NO_CHECK;
+				}
 			}
 			else if (sv->state == SRV_ST_STOPPING) {
 				if ((!(sv->check.state & CHK_ST_ENABLED) && !sv->track) ||
-				    (svs->check.health == svs->check.rise + svs->check.fall - 1))
-					sv_state = 6; /* NOLB */
-				else
-					sv_state = 5; /* NOLB going down */
+				    (svs->check.health == svs->check.rise + svs->check.fall - 1)) {
+					sv_state = SRV_STATS_STATE_NOLB;
+					sv_colour = SRV_STATS_COLOUR_NOLB;
+				} else {
+					sv_state = SRV_STATS_STATE_NOLB_GOING_DOWN;
+					sv_colour = SRV_STATS_COLOUR_GOING_DOWN;
+				}
 			}
 			else {	/* stopped */
-				if ((svs->agent.state & CHK_ST_ENABLED) && !svs->agent.health)
-					sv_state = 1; /* DOWN (agent) */
-				else if ((svs->check.state & CHK_ST_ENABLED) && !svs->check.health)
-					sv_state = 0; /* DOWN */
-				else if ((svs->agent.state & CHK_ST_ENABLED) || (svs->check.state & CHK_ST_ENABLED))
-					sv_state = 2; /* going up */
-				else
-					sv_state = 0; /* DOWN, unchecked */
+				if ((svs->agent.state & CHK_ST_ENABLED) && !svs->agent.health) {
+					sv_state = SRV_STATS_STATE_DOWN_AGENT;
+					sv_colour = SRV_STATS_COLOUR_DOWN;
+				} else if ((svs->check.state & CHK_ST_ENABLED) && !svs->check.health) {
+					sv_state = SRV_STATS_STATE_DOWN; /* DOWN */
+					sv_colour = SRV_STATS_COLOUR_DOWN;
+				} else if ((svs->agent.state & CHK_ST_ENABLED) || (svs->check.state & CHK_ST_ENABLED)) {
+					sv_state = SRV_STATS_STATE_GOING_UP;
+					sv_colour = SRV_STATS_COLOUR_GOING_UP;
+				} else {
+					sv_state = SRV_STATS_STATE_DOWN; /* DOWN, unchecked */
+					sv_colour = SRV_STATS_COLOUR_DOWN;
+				}
 			}
 
 			if (((sv_state <= 1) || (sv->admin & SRV_ADMF_MAINT)) && (appctx->ctx.stats.flags & STAT_HIDE_DOWN)) {
@@ -3910,9 +4305,12 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 				continue;
 			}
 
-			if (stats_dump_sv_stats(si, px, uri ? uri->flags : 0, sv, sv_state))
-				if (bi_putchk(rep, &trash) == -1)
+			if (stats_dump_sv_stats(si, px, uri ? uri->flags : 0, sv, sv_state, sv_colour)) {
+				if (bi_putchk(rep, &trash) == -1) {
+					si_applet_cant_put(si);
 					return 0;
+				}
+			}
 		} /* for sv */
 
 		appctx->ctx.stats.px_st = STAT_PX_ST_BE;
@@ -3920,9 +4318,12 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 
 	case STAT_PX_ST_BE:
 		/* print the backend */
-		if (stats_dump_be_stats(si, px, uri ? uri->flags : 0))
-			if (bi_putchk(rep, &trash) == -1)
+		if (stats_dump_be_stats(si, px, uri ? uri->flags : 0)) {
+			if (bi_putchk(rep, &trash) == -1) {
+				si_applet_cant_put(si);
 				return 0;
+			}
+		}
 
 		appctx->ctx.stats.px_st = STAT_PX_ST_END;
 		/* fall through */
@@ -3930,8 +4331,10 @@ static int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy 
 	case STAT_PX_ST_END:
 		if (appctx->ctx.stats.flags & STAT_FMT_HTML) {
 			stats_dump_html_px_end(si, px);
-			if (bi_putchk(rep, &trash) == -1)
+			if (bi_putchk(rep, &trash) == -1) {
+				si_applet_cant_put(si);
 				return 0;
+			}
 		}
 
 		appctx->ctx.stats.px_st = STAT_PX_ST_FIN;
@@ -4003,26 +4406,20 @@ static void stats_dump_html_head(struct uri_auth *uri)
 	              ".frontend	{background: #e8e8d0;}\n"
 	              ".socket	{background: #d0d0d0;}\n"
 	              ".backend	{background: #e8e8d0;}\n"
-	              ".active0	{background: #ff9090;}\n"
-	              ".active1	{background: #ff9090;}\n"
-	              ".active2	{background: #ffd020;}\n"
-	              ".active3	{background: #ffffa0;}\n"
-	              ".active4	{background: #c0ffc0;}\n"
-	              ".active5	{background: #ffffa0;}\n"  /* NOLB state shows same as going down */
-	              ".active6	{background: #20a0ff;}\n"  /* NOLB state shows different to be detected */
-	              ".active7	{background: #ffffa0;}\n"  /* DRAIN going down = same as going down */
-	              ".active8 {background: #20a0FF;}\n"  /* DRAIN must be detected (weight=0) */
-	              ".active9	{background: #e0e0e0;}\n"
-	              ".backup0	{background: #ff9090;}\n"
-	              ".backup1	{background: #ff9090;}\n"
-	              ".backup2	{background: #ff80ff;}\n"
-	              ".backup3	{background: #c060ff;}\n"
-	              ".backup4	{background: #b0d0ff;}\n"
-	              ".backup5	{background: #c060ff;}\n"  /* NOLB state shows same as going down */
-	              ".backup6	{background: #90b0e0;}\n"  /* NOLB state shows same as going down */
-	              ".backup7	{background: #c060ff;}\n"
-	              ".backup8	{background: #cc9900;}\n"
-	              ".backup9	{background: #e0e0e0;}\n"
+	              ".active_down		{background: #ff9090;}\n"
+	              ".active_going_up		{background: #ffd020;}\n"
+	              ".active_going_down	{background: #ffffa0;}\n"
+	              ".active_up		{background: #c0ffc0;}\n"
+	              ".active_nolb		{background: #20a0ff;}\n"
+	              ".active_draining		{background: #20a0FF;}\n"
+	              ".active_no_check		{background: #e0e0e0;}\n"
+	              ".backup_down		{background: #ff9090;}\n"
+	              ".backup_going_up		{background: #ff80ff;}\n"
+	              ".backup_going_down	{background: #c060ff;}\n"
+	              ".backup_up		{background: #b0d0ff;}\n"
+	              ".backup_nolb		{background: #90b0e0;}\n"
+	              ".backup_draining		{background: #cc9900;}\n"
+	              ".backup_no_check		{background: #e0e0e0;}\n"
 	              ".maintain	{background: #c07820;}\n"
 	              ".rls      {letter-spacing: 0.2em; margin-right: 1px;}\n" /* right letter spacing (used for grouping digits) */
 	              "\n"
@@ -4098,21 +4495,21 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	              "Running tasks: %d/%d; idle = %d %%<br>\n"
 	              "</td><td align=\"center\" nowrap>\n"
 	              "<table class=\"lgd\"><tr>\n"
-	              "<td class=\"active4\">&nbsp;</td><td class=\"noborder\">active UP </td>"
-	              "<td class=\"backup4\">&nbsp;</td><td class=\"noborder\">backup UP </td>"
+	              "<td class=\"active_up\">&nbsp;</td><td class=\"noborder\">active UP </td>"
+	              "<td class=\"backup_up\">&nbsp;</td><td class=\"noborder\">backup UP </td>"
 	              "</tr><tr>\n"
-	              "<td class=\"active3\"></td><td class=\"noborder\">active UP, going down </td>"
-	              "<td class=\"backup3\"></td><td class=\"noborder\">backup UP, going down </td>"
+	              "<td class=\"active_going_down\"></td><td class=\"noborder\">active UP, going down </td>"
+	              "<td class=\"backup_going_down\"></td><td class=\"noborder\">backup UP, going down </td>"
 	              "</tr><tr>\n"
-	              "<td class=\"active2\"></td><td class=\"noborder\">active DOWN, going up </td>"
-	              "<td class=\"backup2\"></td><td class=\"noborder\">backup DOWN, going up </td>"
+	              "<td class=\"active_going_up\"></td><td class=\"noborder\">active DOWN, going up </td>"
+	              "<td class=\"backup_going_up\"></td><td class=\"noborder\">backup DOWN, going up </td>"
 	              "</tr><tr>\n"
-	              "<td class=\"active0\"></td><td class=\"noborder\">active or backup DOWN &nbsp;</td>"
-	              "<td class=\"active9\"></td><td class=\"noborder\">not checked </td>"
+	              "<td class=\"active_down\"></td><td class=\"noborder\">active or backup DOWN &nbsp;</td>"
+	              "<td class=\"active_no_check\"></td><td class=\"noborder\">not checked </td>"
 	              "</tr><tr>\n"
 	              "<td class=\"maintain\"></td><td class=\"noborder\" colspan=\"3\">active or backup DOWN for maintenance (MAINT) &nbsp;</td>"
 	              "</tr><tr>\n"
-	              "<td class=\"active8\"></td><td class=\"noborder\" colspan=\"3\">active or backup SOFT STOPPED for maintenance &nbsp;</td>"
+	              "<td class=\"active_draining\"></td><td class=\"noborder\" colspan=\"3\">active or backup SOFT STOPPED for maintenance &nbsp;</td>"
 	              "</tr></table>\n"
 	              "Note: \"NOLB\"/\"DRAIN\" = UP with load-balancing disabled."
 	              "</td>"
@@ -4136,14 +4533,11 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	              );
 
 	/* scope_txt = search query, appctx->ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
-	memcpy(scope_txt, bo_ptr(si->ob->buf) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
+	memcpy(scope_txt, bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
 	scope_txt[appctx->ctx.stats.scope_len] = '\0';
 
 	chunk_appendf(&trash,
-		      "<li><form method=\"GET\" action=\"%s%s%s\">Scope : <input value=\"%s\" name=\"" STAT_SCOPE_INPUT_NAME "\" size=\"8\" maxlength=\"%d\" tabindex=\"1\"/></form>\n",
-		      uri->uri_prefix,
-		      (appctx->ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
-		      (appctx->ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+		      "<li><form method=\"GET\">Scope : <input value=\"%s\" name=\"" STAT_SCOPE_INPUT_NAME "\" size=\"8\" maxlength=\"%d\" tabindex=\"1\"/></form>\n",
 		      (appctx->ctx.stats.scope_len > 0) ? scope_txt : "",
 		      STAT_SCOPE_TXT_MAXLEN);
 
@@ -4151,7 +4545,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	scope_txt[0] = 0;
 	if (appctx->ctx.stats.scope_len) {
 		strcpy(scope_txt, STAT_SCOPE_PATTERN);
-		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si->ob->buf) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
+		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
 		scope_txt[strlen(STAT_SCOPE_PATTERN) + appctx->ctx.stats.scope_len] = 0;
 	}
 
@@ -4217,7 +4611,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 		switch (appctx->ctx.stats.st_code) {
 		case STAT_STATUS_DONE:
 			chunk_appendf(&trash,
-			              "<p><div class=active4>"
+			              "<p><div class=active_up>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Action processed successfully."
 			              "</div>\n", uri->uri_prefix,
@@ -4227,7 +4621,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 			break;
 		case STAT_STATUS_NONE:
 			chunk_appendf(&trash,
-			              "<p><div class=active3>"
+			              "<p><div class=active_going_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Nothing has changed."
 			              "</div>\n", uri->uri_prefix,
@@ -4237,7 +4631,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 			break;
 		case STAT_STATUS_PART:
 			chunk_appendf(&trash,
-			              "<p><div class=active3>"
+			              "<p><div class=active_going_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Action partially processed.<br>"
 			              "Some server names are probably unknown or ambiguous (duplicated names in the backend)."
@@ -4248,7 +4642,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 			break;
 		case STAT_STATUS_ERRP:
 			chunk_appendf(&trash,
-			              "<p><div class=active0>"
+			              "<p><div class=active_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Action not processed because of invalid parameters."
 			              "<ul>"
@@ -4263,7 +4657,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 			break;
 		case STAT_STATUS_EXCD:
 			chunk_appendf(&trash,
-			              "<p><div class=active0>"
+			              "<p><div class=active_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "<b>Action not processed : the buffer couldn't store all the data.<br>"
 			              "You should retry with less servers at a time.</b>"
@@ -4274,7 +4668,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 			break;
 		case STAT_STATUS_DENY:
 			chunk_appendf(&trash,
-			              "<p><div class=active0>"
+			              "<p><div class=active_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "<b>Action denied.</b>"
 			              "</div>\n", uri->uri_prefix,
@@ -4284,7 +4678,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 			break;
 		default:
 			chunk_appendf(&trash,
-			              "<p><div class=active9>"
+			              "<p><div class=active_no_check>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "Unexpected result."
 			              "</div>\n", uri->uri_prefix,
@@ -4308,13 +4702,13 @@ static void stats_dump_html_end()
  * either CSV or HTML format. <uri> contains some HTML-specific parameters that
  * are ignored for CSV format (hence <uri> may be NULL there). It returns 0 if
  * it had to stop writing data and an I/O is needed, 1 if the dump is finished
- * and the session must be closed, or -1 in case of any error. This function is
+ * and the stream must be closed, or -1 in case of any error. This function is
  * used by both the CLI and the HTTP handlers.
  */
 static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_auth *uri)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
-	struct channel *rep = si->ib;
+	struct channel *rep = si_ic(si);
 	struct proxy *px;
 
 	chunk_reset(&trash);
@@ -4330,8 +4724,10 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 		else
 			stats_dump_csv_header();
 
-		if (bi_putchk(rep, &trash) == -1)
+		if (bi_putchk(rep, &trash) == -1) {
+			si_applet_cant_put(si);
 			return 0;
+		}
 
 		appctx->st2 = STAT_ST_INFO;
 		/* fall through */
@@ -4339,8 +4735,10 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 	case STAT_ST_INFO:
 		if (appctx->ctx.stats.flags & STAT_FMT_HTML) {
 			stats_dump_html_info(si, uri);
-			if (bi_putchk(rep, &trash) == -1)
+			if (bi_putchk(rep, &trash) == -1) {
+				si_applet_cant_put(si);
 				return 0;
+			}
 		}
 
 		appctx->ctx.stats.px = proxy;
@@ -4352,7 +4750,7 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 		/* dump proxies */
 		while (appctx->ctx.stats.px) {
 			if (buffer_almost_full(rep->buf)) {
-				rep->flags |= CF_WAKE_WRITE;
+				si_applet_cant_put(si);
 				return 0;
 			}
 
@@ -4373,8 +4771,10 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 	case STAT_ST_END:
 		if (appctx->ctx.stats.flags & STAT_FMT_HTML) {
 			stats_dump_html_end();
-			if (bi_putchk(rep, &trash) == -1)
+			if (bi_putchk(rep, &trash) == -1) {
+				si_applet_cant_put(si);
 				return 0;
+			}
 		}
 
 		appctx->st2 = STAT_ST_FIN;
@@ -4397,7 +4797,7 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
  */
 static int stats_process_http_post(struct stream_interface *si)
 {
-	struct session *s = session_from_task(si->owner);
+	struct stream *s = si_strm(si);
 	struct appctx *appctx = objt_appctx(si->end);
 
 	struct proxy *px = NULL;
@@ -4418,13 +4818,13 @@ static int stats_process_http_post(struct stream_interface *si)
 	int reql;
 
 	temp = get_trash_chunk();
-	if (temp->size < s->txn.req.body_len) {
+	if (temp->size < s->txn->req.body_len) {
 		/* too large request */
 		appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
 		goto out;
 	}
 
-	reql = bo_getblk(si->ob, temp->str, s->txn.req.body_len, s->txn.req.eoh + 2);
+	reql = bo_getblk(si_oc(si), temp->str, s->txn->req.body_len, s->txn->req.eoh + 2);
 	if (reql <= 0) {
 		/* we need more data */
 		appctx->ctx.stats.st_code = STAT_STATUS_NONE;
@@ -4475,7 +4875,7 @@ static int stats_process_http_post(struct stream_interface *si)
 
 			/* Now we can check the key to see what to do */
 			if (!px && (strcmp(key, "b") == 0)) {
-				if ((px = findproxy(value, PR_CAP_BE)) == NULL) {
+				if ((px = proxy_be_by_name(value)) == NULL) {
 					/* the backend name is unknown or ambiguous (duplicate names) */
 					appctx->ctx.stats.st_code = STAT_STATUS_ERRP;
 					goto out;
@@ -4666,11 +5066,11 @@ static int stats_process_http_post(struct stream_interface *si)
 						break;
 					case ST_ADM_ACTION_SHUTDOWN:
 						if (px->state != PR_STSTOPPED) {
-							struct session *sess, *sess_bck;
+							struct stream *sess, *sess_bck;
 
 							list_for_each_entry_safe(sess, sess_bck, &sv->actconns, by_srv)
 								if (sess->srv_conn == sv)
-									session_shutdown(sess, SN_ERR_KILLED);
+									stream_shutdown(sess, SF_ERR_KILLED);
 
 							altered_servers++;
 							total_servers++;
@@ -4716,7 +5116,7 @@ static int stats_process_http_post(struct stream_interface *si)
 
 static int stats_send_http_headers(struct stream_interface *si)
 {
-	struct session *s = session_from_task(si->owner);
+	struct stream *s = si_strm(si);
 	struct uri_auth *uri = s->be->uri_auth;
 	struct appctx *appctx = objt_appctx(si->end);
 
@@ -4738,11 +5138,13 @@ static int stats_send_http_headers(struct stream_interface *si)
 	else
 		chunk_appendf(&trash, "\r\n");
 
-	s->txn.status = 200;
+	s->txn->status = 200;
 	s->logs.tv_request = now;
 
-	if (bi_putchk(si->ib, &trash) == -1)
+	if (bi_putchk(si_ic(si), &trash) == -1) {
+		si_applet_cant_put(si);
 		return 0;
+	}
 
 	return 1;
 }
@@ -4750,7 +5152,7 @@ static int stats_send_http_headers(struct stream_interface *si)
 static int stats_send_http_redirect(struct stream_interface *si)
 {
 	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
-	struct session *s = session_from_task(si->owner);
+	struct stream *s = si_strm(si);
 	struct uri_auth *uri = s->be->uri_auth;
 	struct appctx *appctx = objt_appctx(si->end);
 
@@ -4758,7 +5160,7 @@ static int stats_send_http_redirect(struct stream_interface *si)
 	scope_txt[0] = 0;
 	if (appctx->ctx.stats.scope_len) {
 		strcpy(scope_txt, STAT_SCOPE_PATTERN);
-		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si->ob->buf) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
+		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
 		scope_txt[strlen(STAT_SCOPE_PATTERN) + appctx->ctx.stats.scope_len] = 0;
 	}
 
@@ -4772,6 +5174,7 @@ static int stats_send_http_redirect(struct stream_interface *si)
 		     "Content-Type: text/plain\r\n"
 		     "Connection: close\r\n"
 		     "Location: %s;st=%s%s%s%s\r\n"
+		     "Content-length: 0\r\n"
 		     "\r\n",
 		     uri->uri_prefix,
 		     ((appctx->ctx.stats.st_code > STAT_STATUS_INIT) &&
@@ -4783,11 +5186,13 @@ static int stats_send_http_redirect(struct stream_interface *si)
 		     (appctx->ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
 		     scope_txt);
 
-	s->txn.status = 303;
+	s->txn->status = 303;
 	s->logs.tv_request = now;
 
-	if (bi_putchk(si->ib, &trash) == -1)
+	if (bi_putchk(si_ic(si), &trash) == -1) {
+		si_applet_cant_put(si);
 		return 0;
+	}
 
 	return 1;
 }
@@ -4797,12 +5202,12 @@ static int stats_send_http_redirect(struct stream_interface *si)
  * appctx->st0 contains the operation in progress (dump, done). The handler
  * automatically unregisters itself once transfer is complete.
  */
-static void http_stats_io_handler(struct stream_interface *si)
+static void http_stats_io_handler(struct appctx *appctx)
 {
-	struct appctx *appctx = __objt_appctx(si->end);
-	struct session *s = session_from_task(si->owner);
-	struct channel *req = si->ob;
-	struct channel *res = si->ib;
+	struct stream_interface *si = appctx->owner;
+	struct stream *s = si_strm(si);
+	struct channel *req = si_oc(si);
+	struct channel *res = si_ic(si);
 
 	if (unlikely(si->state == SI_ST_DIS || si->state == SI_ST_CLO))
 		goto out;
@@ -4814,7 +5219,7 @@ static void http_stats_io_handler(struct stream_interface *si)
 	/* all states are processed in sequence */
 	if (appctx->st0 == STAT_HTTP_HEAD) {
 		if (stats_send_http_headers(si)) {
-			if (s->txn.meth == HTTP_METH_HEAD)
+			if (s->txn->meth == HTTP_METH_HEAD)
 				appctx->st0 = STAT_HTTP_DONE;
 			else
 				appctx->st0 = STAT_HTTP_DUMP;
@@ -4822,7 +5227,7 @@ static void http_stats_io_handler(struct stream_interface *si)
 	}
 
 	if (appctx->st0 == STAT_HTTP_DUMP) {
-		unsigned int prev_len = si->ib->buf->i;
+		unsigned int prev_len = si_ib(si)->i;
 		unsigned int data_len;
 		unsigned int last_len;
 		unsigned int last_fwd = 0;
@@ -4833,20 +5238,21 @@ static void http_stats_io_handler(struct stream_interface *si)
 			 * the output area. For this, we temporarily disable
 			 * forwarding on the channel.
 			 */
-			last_fwd = si->ib->to_forward;
-			si->ib->to_forward = 0;
+			last_fwd = si_ic(si)->to_forward;
+			si_ic(si)->to_forward = 0;
 			chunk_printf(&trash, "\r\n000000\r\n");
-			if (bi_putchk(si->ib, &trash) == -1) {
-				si->ib->to_forward = last_fwd;
-				goto fail;
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				si_applet_cant_put(si);
+				si_ic(si)->to_forward = last_fwd;
+				goto out;
 			}
 		}
 
-		data_len = si->ib->buf->i;
+		data_len = si_ib(si)->i;
 		if (stats_dump_stat_to_buffer(si, s->be->uri_auth))
 			appctx->st0 = STAT_HTTP_DONE;
 
-		last_len = si->ib->buf->i;
+		last_len = si_ib(si)->i;
 
 		/* Now we must either adjust or remove the chunk size. This is
 		 * not easy because the chunk size might wrap at the end of the
@@ -4856,25 +5262,26 @@ static void http_stats_io_handler(struct stream_interface *si)
 		 * applet.
 		 */
 		if (appctx->ctx.stats.flags & STAT_CHUNKED) {
-			si->ib->total  -= (last_len - prev_len);
-			si->ib->buf->i -= (last_len - prev_len);
+			si_ic(si)->total -= (last_len - prev_len);
+			si_ib(si)->i     -= (last_len - prev_len);
 
 			if (last_len != data_len) {
 				chunk_printf(&trash, "\r\n%06x\r\n", (last_len - data_len));
-				bi_putchk(si->ib, &trash);
+				if (bi_putchk(si_ic(si), &trash) == -1)
+					si_applet_cant_put(si);
 
-				si->ib->total  += (last_len - data_len);
-				si->ib->buf->i += (last_len - data_len);
+				si_ic(si)->total += (last_len - data_len);
+				si_ib(si)->i     += (last_len - data_len);
 			}
 			/* now re-enable forwarding */
-			channel_forward(si->ib, last_fwd);
+			channel_forward(si_ic(si), last_fwd);
 		}
 	}
 
 	if (appctx->st0 == STAT_HTTP_POST) {
 		if (stats_process_http_post(si))
 			appctx->st0 = STAT_HTTP_LAST;
-		else if (si->ob->flags & CF_SHUTR)
+		else if (si_oc(si)->flags & CF_SHUTR)
 			appctx->st0 = STAT_HTTP_DONE;
 	}
 
@@ -4886,11 +5293,13 @@ static void http_stats_io_handler(struct stream_interface *si)
 	if (appctx->st0 == STAT_HTTP_DONE) {
 		if (appctx->ctx.stats.flags & STAT_CHUNKED) {
 			chunk_printf(&trash, "\r\n0\r\n\r\n");
-			if (bi_putchk(si->ib, &trash) == -1)
-				goto fail;
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				si_applet_cant_put(si);
+				goto out;
+			}
 		}
 		/* eat the whole request */
-		bo_skip(si->ob, si->ob->buf->o);
+		bo_skip(si_oc(si), si_ob(si)->o);
 		res->flags |= CF_READ_NULL;
 		si_shutr(si);
 	}
@@ -4904,20 +5313,8 @@ static void http_stats_io_handler(struct stream_interface *si)
 			res->flags |= CF_READ_NULL;
 		}
 	}
-
- fail:
-	/* update all other flags and resync with the other side */
-	si_update(si);
-
-	/* we don't want to expire timeouts while we're processing requests */
-	si->ib->rex = TICK_ETERNITY;
-	si->ob->wex = TICK_ETERNITY;
-
  out:
-	if (unlikely(si->state == SI_ST_DIS || si->state == SI_ST_CLO)) {
-		/* check that we have released everything then unregister */
-		stream_int_unregister_handler(si);
-	}
+	/* just to make gcc happy */ ;
 }
 
 
@@ -4966,12 +5363,12 @@ static inline const char *get_conn_data_name(const struct connection *conn)
 	return ptr;
 }
 
-/* This function dumps a complete session state onto the stream interface's
- * read buffer. The session has to be set in sess->target. It returns
+/* This function dumps a complete stream state onto the stream interface's
+ * read buffer. The stream has to be set in sess->target. It returns
  * 0 if the output buffer is full and it needs to be called again, otherwise
  * non-zero. It is designed to be called from stats_dump_sess_to_buffer() below.
  */
-static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct session *sess)
+static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct stream *sess)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
 	struct tm tm;
@@ -4983,17 +5380,19 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 	chunk_reset(&trash);
 
 	if (appctx->ctx.sess.section > 0 && appctx->ctx.sess.uid != sess->uniq_id) {
-		/* session changed, no need to go any further */
+		/* stream changed, no need to go any further */
 		chunk_appendf(&trash, "  *** session terminated while we were watching it ***\n");
-		if (bi_putchk(si->ib, &trash) == -1)
+		if (bi_putchk(si_ic(si), &trash) == -1) {
+			si_applet_cant_put(si);
 			return 0;
+		}
 		appctx->ctx.sess.uid = 0;
 		appctx->ctx.sess.section = 0;
 		return 1;
 	}
 
 	switch (appctx->ctx.sess.section) {
-	case 0: /* main status of the session */
+	case 0: /* main status of the stream */
 		appctx->ctx.sess.uid = sess->uniq_id;
 		appctx->ctx.sess.section = 1;
 		/* fall through */
@@ -5006,9 +5405,9 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 			     tm.tm_mday, monthname[tm.tm_mon], tm.tm_year+1900,
 			     tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(sess->logs.accept_date.tv_usec),
 			     sess->uniq_id,
-			     sess->listener && sess->listener->proto->name ? sess->listener->proto->name : "?");
+			     strm_li(sess) ? strm_li(sess)->proto->name : "?");
 
-		conn = objt_conn(sess->si[0].end);
+		conn = objt_conn(strm_orig(sess));
 		switch (conn ? addr_to_str(&conn->addr.from, pn, sizeof(pn)) : AF_UNSPEC) {
 		case AF_INET:
 		case AF_INET6:
@@ -5016,7 +5415,7 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 			              pn, get_host_port(&conn->addr.from));
 			break;
 		case AF_UNIX:
-			chunk_appendf(&trash, " source=unix:%d\n", sess->listener->luid);
+			chunk_appendf(&trash, " source=unix:%d\n", strm_li(sess)->luid);
 			break;
 		default:
 			/* no more information to print right now */
@@ -5030,9 +5429,9 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 
 		chunk_appendf(&trash,
 			     "  frontend=%s (id=%u mode=%s), listener=%s (id=%u)",
-			     sess->fe->id, sess->fe->uuid, sess->fe->mode ? "http" : "tcp",
-			     sess->listener ? sess->listener->name ? sess->listener->name : "?" : "?",
-			     sess->listener ? sess->listener->luid : 0);
+			     strm_fe(sess)->id, strm_fe(sess)->uuid, strm_fe(sess)->mode ? "http" : "tcp",
+			     strm_li(sess) ? strm_li(sess)->name ? strm_li(sess)->name : "?" : "?",
+			     strm_li(sess) ? strm_li(sess)->luid : 0);
 
 		if (conn)
 			conn_get_to_addr(conn);
@@ -5044,7 +5443,7 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 				     pn, get_host_port(&conn->addr.to));
 			break;
 		case AF_UNIX:
-			chunk_appendf(&trash, " addr=unix:%d\n", sess->listener->luid);
+			chunk_appendf(&trash, " addr=unix:%d\n", strm_li(sess)->luid);
 			break;
 		default:
 			/* no more information to print right now */
@@ -5120,10 +5519,11 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 			     " age=%s)\n",
 			     human_time(now.tv_sec - sess->logs.accept_date.tv_sec, 1));
 
-		chunk_appendf(&trash,
-			     "  txn=%p flags=0x%x meth=%d status=%d req.st=%s rsp.st=%s\n",
-			     &sess->txn, sess->txn.flags, sess->txn.meth, sess->txn.status,
-			     http_msg_state_str(sess->txn.req.msg_state), http_msg_state_str(sess->txn.rsp.msg_state));
+		if (sess->txn)
+			chunk_appendf(&trash,
+			     "  txn=%p flags=0x%x meth=%d status=%d req.st=%s rsp.st=%s waiting=%d\n",
+			      sess->txn, sess->txn->flags, sess->txn->meth, sess->txn->status,
+			      http_msg_state_str(sess->txn->req.msg_state), http_msg_state_str(sess->txn->rsp.msg_state), !LIST_ISEMPTY(&sess->buffer_wait));
 
 		chunk_appendf(&trash,
 			     "  si[0]=%p (state=%s flags=0x%02x endp0=%s:%p exp=%s, et=0x%03x)\n",
@@ -5190,7 +5590,7 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 			              obj_base_ptr(conn->target));
 
 			chunk_appendf(&trash,
-			              "      flags=0x%08x fd=%d fd_spec_e=%02x fd_spec_p=%d updt=%d\n",
+			              "      flags=0x%08x fd=%d fd.state=%02x fd.cache=%d updt=%d\n",
 			              conn->flags,
 			              conn->t.sock.fd,
 			              conn->t.sock.fd >= 0 ? fdtab[conn->t.sock.fd].state : 0,
@@ -5210,63 +5610,65 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 		chunk_appendf(&trash,
 			     "  req=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
 			     "      an_exp=%s",
-			     sess->req,
-			     sess->req->flags, sess->req->analysers,
-			     sess->req->pipe ? sess->req->pipe->data : 0,
-			     sess->req->to_forward, sess->req->total,
-			     sess->req->analyse_exp ?
-			     human_time(TICKS_TO_MS(sess->req->analyse_exp - now_ms),
+			     &sess->req,
+			     sess->req.flags, sess->req.analysers,
+			     sess->req.pipe ? sess->req.pipe->data : 0,
+			     sess->req.to_forward, sess->req.total,
+			     sess->req.analyse_exp ?
+			     human_time(TICKS_TO_MS(sess->req.analyse_exp - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>");
 
 		chunk_appendf(&trash,
 			     " rex=%s",
-			     sess->req->rex ?
-			     human_time(TICKS_TO_MS(sess->req->rex - now_ms),
+			     sess->req.rex ?
+			     human_time(TICKS_TO_MS(sess->req.rex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>");
 
 		chunk_appendf(&trash,
 			     " wex=%s\n"
 			     "      buf=%p data=%p o=%d p=%d req.next=%d i=%d size=%d\n",
-			     sess->req->wex ?
-			     human_time(TICKS_TO_MS(sess->req->wex - now_ms),
+			     sess->req.wex ?
+			     human_time(TICKS_TO_MS(sess->req.wex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>",
-			     sess->req->buf,
-			     sess->req->buf->data, sess->req->buf->o,
-			     (int)(sess->req->buf->p - sess->req->buf->data),
-			     sess->txn.req.next, sess->req->buf->i,
-			     sess->req->buf->size);
+			     sess->req.buf,
+			     sess->req.buf->data, sess->req.buf->o,
+			     (int)(sess->req.buf->p - sess->req.buf->data),
+			     sess->txn ? sess->txn->req.next : 0, sess->req.buf->i,
+			     sess->req.buf->size);
 
 		chunk_appendf(&trash,
 			     "  res=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
 			     "      an_exp=%s",
-			     sess->rep,
-			     sess->rep->flags, sess->rep->analysers,
-			     sess->rep->pipe ? sess->rep->pipe->data : 0,
-			     sess->rep->to_forward, sess->rep->total,
-			     sess->rep->analyse_exp ?
-			     human_time(TICKS_TO_MS(sess->rep->analyse_exp - now_ms),
+			     &sess->res,
+			     sess->res.flags, sess->res.analysers,
+			     sess->res.pipe ? sess->res.pipe->data : 0,
+			     sess->res.to_forward, sess->res.total,
+			     sess->res.analyse_exp ?
+			     human_time(TICKS_TO_MS(sess->res.analyse_exp - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>");
 
 		chunk_appendf(&trash,
 			     " rex=%s",
-			     sess->rep->rex ?
-			     human_time(TICKS_TO_MS(sess->rep->rex - now_ms),
+			     sess->res.rex ?
+			     human_time(TICKS_TO_MS(sess->res.rex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>");
 
 		chunk_appendf(&trash,
 			     " wex=%s\n"
 			     "      buf=%p data=%p o=%d p=%d rsp.next=%d i=%d size=%d\n",
-			     sess->rep->wex ?
-			     human_time(TICKS_TO_MS(sess->rep->wex - now_ms),
+			     sess->res.wex ?
+			     human_time(TICKS_TO_MS(sess->res.wex - now_ms),
 					TICKS_TO_MS(1000)) : "<NEVER>",
-			     sess->rep->buf,
-			     sess->rep->buf->data, sess->rep->buf->o,
-			     (int)(sess->rep->buf->p - sess->rep->buf->data),
-			     sess->txn.rsp.next, sess->rep->buf->i,
-			     sess->rep->buf->size);
+			     sess->res.buf,
+			     sess->res.buf->data, sess->res.buf->o,
+			     (int)(sess->res.buf->p - sess->res.buf->data),
+			     sess->txn ? sess->txn->rsp.next : 0, sess->res.buf->i,
+			     sess->res.buf->size);
 
-		if (bi_putchk(si->ib, &trash) == -1)
+		if (bi_putchk(si_ic(si), &trash) == -1) {
+			si_applet_cant_put(si);
 			return 0;
+		}
 
 		/* use other states to dump the contents */
 	}
@@ -5275,6 +5677,64 @@ static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct se
 	appctx->ctx.sess.section = 0;
 	return 1;
 }
+
+#if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
+static int stats_tlskeys_list(struct stream_interface *si) {
+	struct appctx *appctx = __objt_appctx(si->end);
+
+	switch (appctx->st2) {
+	case STAT_ST_INIT:
+		/* Display the column headers. If the message cannot be sent,
+		 * quit the fucntion with returning 0. The function is called
+		 * later and restart at the state "STAT_ST_INIT".
+		 */
+		chunk_reset(&trash);
+		chunk_appendf(&trash, "# id (file)\n");
+		if (bi_putchk(si_ic(si), &trash) == -1) {
+			si_applet_cant_put(si);
+			return 0;
+		}
+
+		/* Now, we start the browsing of the references lists.
+		 * Note that the following call to LIST_ELEM return bad pointer. The only
+		 * available field of this pointer is <list>. It is used with the function
+		 * tlskeys_list_get_next() for retruning the first available entry
+		 */
+		appctx->ctx.tlskeys.ref = LIST_ELEM(&tlskeys_reference, struct tls_keys_ref *, list);
+		appctx->ctx.tlskeys.ref = tlskeys_list_get_next(appctx->ctx.tlskeys.ref, &tlskeys_reference);
+
+		appctx->st2 = STAT_ST_LIST;
+		/* fall through */
+
+	case STAT_ST_LIST:
+		while (appctx->ctx.tlskeys.ref) {
+			chunk_reset(&trash);
+
+			chunk_appendf(&trash, "%d (%s)\n", appctx->ctx.tlskeys.ref->unique_id,
+			              appctx->ctx.tlskeys.ref->filename);
+
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				/* let's try again later from this stream. We add ourselves into
+				 * this stream's users so that it can remove us upon termination.
+				 */
+				si_applet_cant_put(si);
+				return 0;
+			}
+
+			/* get next list entry and check the end of the list */
+			appctx->ctx.tlskeys.ref = tlskeys_list_get_next(appctx->ctx.tlskeys.ref, &tlskeys_reference);
+		}
+
+		appctx->st2 = STAT_ST_FIN;
+		/* fall through */
+
+	default:
+		appctx->st2 = STAT_ST_FIN;
+		return 1;
+	}
+	return 0;
+}
+#endif
 
 static int stats_pats_list(struct stream_interface *si)
 {
@@ -5288,13 +5748,15 @@ static int stats_pats_list(struct stream_interface *si)
 		 */
 		chunk_reset(&trash);
 		chunk_appendf(&trash, "# id (file) description\n");
-		if (bi_putchk(si->ib, &trash) == -1)
+		if (bi_putchk(si_ic(si), &trash) == -1) {
+			si_applet_cant_put(si);
 			return 0;
+		}
 
 		/* Now, we start the browsing of the references lists.
 		 * Note that the following call to LIST_ELEM return bad pointer. The only
-		 * avalaible field of this pointer is <list>. It is used with the function
-		 * pat_list_get_next() for retruning the first avalaible entry
+		 * available field of this pointer is <list>. It is used with the function
+		 * pat_list_get_next() for retruning the first available entry
 		 */
 		appctx->ctx.map.ref = LIST_ELEM(&pattern_reference, struct pat_ref *, list);
 		appctx->ctx.map.ref = pat_list_get_next(appctx->ctx.map.ref, &pattern_reference,
@@ -5313,10 +5775,11 @@ static int stats_pats_list(struct stream_interface *si)
 			              appctx->ctx.map.ref->reference ? appctx->ctx.map.ref->reference : "",
 			              appctx->ctx.map.ref->display);
 
-			if (bi_putchk(si->ib, &trash) == -1) {
-				/* let's try again later from this session. We add ourselves into
-				 * this session's users so that it can remove us upon termination.
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				/* let's try again later from this stream. We add ourselves into
+				 * this stream's users so that it can remove us upon termination.
 				 */
+				si_applet_cant_put(si);
 				return 0;
 			}
 
@@ -5357,10 +5820,10 @@ static int stats_map_lookup(struct stream_interface *si)
 			chunk_reset(&trash);
 
 			/* execute pattern matching */
-			sample.type = SMP_T_STR;
-			sample.flags |= SMP_F_CONST;
-			sample.data.str.len = appctx->ctx.map.chunk.len;
-			sample.data.str.str = appctx->ctx.map.chunk.str;
+			sample.data.type = SMP_T_STR;
+			sample.flags = SMP_F_CONST;
+			sample.data.u.str.len = appctx->ctx.map.chunk.len;
+			sample.data.u.str.str = appctx->ctx.map.chunk.str;
 			if (appctx->ctx.map.expr->pat_head->match &&
 			    sample_convert(&sample, appctx->ctx.map.expr->pat_head->expect_type))
 				pat = appctx->ctx.map.expr->pat_head->match(&sample, appctx->ctx.map.expr, 1);
@@ -5420,9 +5883,9 @@ static int stats_map_lookup(struct stream_interface *si)
 
 				/* display return value */
 				if (appctx->ctx.map.display_flags == PAT_REF_MAP) {
-					if (pat->smp && pat->ref && pat->ref->sample)
-						chunk_appendf(&trash, ", value=\"%s\", type=\"%s\"",
-						              pat->ref->sample, smp_to_type[pat->smp->type]);
+					if (pat->data && pat->ref && pat->ref->sample)
+						chunk_appendf(&trash, ", value=\"%s\", type=\"%s\"", pat->ref->sample,
+						              smp_to_type[pat->data->type]);
 					else
 						chunk_appendf(&trash, ", value=none");
 				}
@@ -5431,10 +5894,11 @@ static int stats_map_lookup(struct stream_interface *si)
 			chunk_appendf(&trash, "\n");
 
 			/* display response */
-			if (bi_putchk(si->ib, &trash) == -1) {
-				/* let's try again later from this session. We add ourselves into
-				 * this session's users so that it can remove us upon termination.
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				/* let's try again later from this stream. We add ourselves into
+				 * this stream's users so that it can remove us upon termination.
 				 */
+				si_applet_cant_put(si);
 				return 0;
 			}
 
@@ -5481,10 +5945,11 @@ static int stats_pat_list(struct stream_interface *si)
 				chunk_appendf(&trash, "%p %s\n",
 				              appctx->ctx.map.elt, appctx->ctx.map.elt->pattern);
 
-			if (bi_putchk(si->ib, &trash) == -1) {
-				/* let's try again later from this session. We add ourselves into
-				 * this session's users so that it can remove us upon termination.
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				/* let's try again later from this stream. We add ourselves into
+				 * this stream's users so that it can remove us upon termination.
 				 */
+				si_applet_cant_put(si);
 				return 0;
 			}
 
@@ -5504,7 +5969,7 @@ static int stats_pat_list(struct stream_interface *si)
 	}
 }
 
-/* This function dumps all sessions' states onto the stream interface's
+/* This function dumps all streams' states onto the stream interface's
  * read buffer. It returns 0 if the output buffer is full and it needs
  * to be called again, otherwise non-zero. It is designed to be called
  * from stats_dump_sess_to_buffer() below.
@@ -5514,9 +5979,9 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 	struct appctx *appctx = __objt_appctx(si->end);
 	struct connection *conn;
 
-	if (unlikely(si->ib->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
+	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
 		/* If we're forced to shut down, we might have to remove our
-		 * reference to the last session being dumped.
+		 * reference to the last stream being dumped.
 		 */
 		if (appctx->st2 == STAT_ST_LIST) {
 			if (!LIST_ISEMPTY(&appctx->ctx.sess.bref.users)) {
@@ -5532,30 +5997,30 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 	switch (appctx->st2) {
 	case STAT_ST_INIT:
 		/* the function had not been called yet, let's prepare the
-		 * buffer for a response. We initialize the current session
+		 * buffer for a response. We initialize the current stream
 		 * pointer to the first in the global list. When a target
-		 * session is being destroyed, it is responsible for updating
+		 * stream is being destroyed, it is responsible for updating
 		 * this pointer. We know we have reached the end when this
-		 * pointer points back to the head of the sessions list.
+		 * pointer points back to the head of the streams list.
 		 */
 		LIST_INIT(&appctx->ctx.sess.bref.users);
-		appctx->ctx.sess.bref.ref = sessions.n;
+		appctx->ctx.sess.bref.ref = streams.n;
 		appctx->st2 = STAT_ST_LIST;
 		/* fall through */
 
 	case STAT_ST_LIST:
-		/* first, let's detach the back-ref from a possible previous session */
+		/* first, let's detach the back-ref from a possible previous stream */
 		if (!LIST_ISEMPTY(&appctx->ctx.sess.bref.users)) {
 			LIST_DEL(&appctx->ctx.sess.bref.users);
 			LIST_INIT(&appctx->ctx.sess.bref.users);
 		}
 
 		/* and start from where we stopped */
-		while (appctx->ctx.sess.bref.ref != &sessions) {
+		while (appctx->ctx.sess.bref.ref != &streams) {
 			char pn[INET6_ADDRSTRLEN];
-			struct session *curr_sess;
+			struct stream *curr_sess;
 
-			curr_sess = LIST_ELEM(appctx->ctx.sess.bref.ref, struct session *, list);
+			curr_sess = LIST_ELEM(appctx->ctx.sess.bref.ref, struct stream *, list);
 
 			if (appctx->ctx.sess.target) {
 				if (appctx->ctx.sess.target != (void *)-1 && appctx->ctx.sess.target != curr_sess)
@@ -5566,7 +6031,7 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 				if (!stats_dump_full_sess_to_buffer(si, curr_sess))
 					return 0;
 
-				/* session dump complete */
+				/* stream dump complete */
 				LIST_DEL(&appctx->ctx.sess.bref.users);
 				LIST_INIT(&appctx->ctx.sess.bref.users);
 				if (appctx->ctx.sess.target != (void *)-1) {
@@ -5580,10 +6045,9 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 			chunk_appendf(&trash,
 				     "%p: proto=%s",
 				     curr_sess,
-				     curr_sess->listener->proto->name);
+				     strm_li(curr_sess) ? strm_li(curr_sess)->proto->name : "?");
 
-
-			conn = objt_conn(curr_sess->si[0].end);
+			conn = objt_conn(strm_orig(curr_sess));
 			switch (conn ? addr_to_str(&conn->addr.from, pn, sizeof(pn)) : AF_UNSPEC) {
 			case AF_INET:
 			case AF_INET6:
@@ -5591,7 +6055,7 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 					     " src=%s:%d fe=%s be=%s srv=%s",
 					     pn,
 					     get_host_port(&conn->addr.from),
-					     curr_sess->fe->id,
+					     strm_fe(curr_sess)->id,
 					     (curr_sess->be->cap & PR_CAP_BE) ? curr_sess->be->id : "<NONE>",
 					     objt_server(curr_sess->target) ? objt_server(curr_sess->target)->id : "<none>"
 					     );
@@ -5599,8 +6063,8 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 			case AF_UNIX:
 				chunk_appendf(&trash,
 					     " src=unix:%d fe=%s be=%s srv=%s",
-					     curr_sess->listener->luid,
-					     curr_sess->fe->id,
+					     strm_li(curr_sess)->luid,
+					     strm_fe(curr_sess)->id,
 					     (curr_sess->be->cap & PR_CAP_BE) ? curr_sess->be->id : "<NONE>",
 					     objt_server(curr_sess->target) ? objt_server(curr_sess->target)->id : "<none>"
 					     );
@@ -5615,44 +6079,44 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 
 			chunk_appendf(&trash,
 				     " rq[f=%06xh,i=%d,an=%02xh,rx=%s",
-				     curr_sess->req->flags,
-				     curr_sess->req->buf->i,
-				     curr_sess->req->analysers,
-				     curr_sess->req->rex ?
-				     human_time(TICKS_TO_MS(curr_sess->req->rex - now_ms),
+				     curr_sess->req.flags,
+				     curr_sess->req.buf->i,
+				     curr_sess->req.analysers,
+				     curr_sess->req.rex ?
+				     human_time(TICKS_TO_MS(curr_sess->req.rex - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
 			chunk_appendf(&trash,
 				     ",wx=%s",
-				     curr_sess->req->wex ?
-				     human_time(TICKS_TO_MS(curr_sess->req->wex - now_ms),
+				     curr_sess->req.wex ?
+				     human_time(TICKS_TO_MS(curr_sess->req.wex - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
 			chunk_appendf(&trash,
 				     ",ax=%s]",
-				     curr_sess->req->analyse_exp ?
-				     human_time(TICKS_TO_MS(curr_sess->req->analyse_exp - now_ms),
+				     curr_sess->req.analyse_exp ?
+				     human_time(TICKS_TO_MS(curr_sess->req.analyse_exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
 			chunk_appendf(&trash,
 				     " rp[f=%06xh,i=%d,an=%02xh,rx=%s",
-				     curr_sess->rep->flags,
-				     curr_sess->rep->buf->i,
-				     curr_sess->rep->analysers,
-				     curr_sess->rep->rex ?
-				     human_time(TICKS_TO_MS(curr_sess->rep->rex - now_ms),
+				     curr_sess->res.flags,
+				     curr_sess->res.buf->i,
+				     curr_sess->res.analysers,
+				     curr_sess->res.rex ?
+				     human_time(TICKS_TO_MS(curr_sess->res.rex - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
 			chunk_appendf(&trash,
 				     ",wx=%s",
-				     curr_sess->rep->wex ?
-				     human_time(TICKS_TO_MS(curr_sess->rep->wex - now_ms),
+				     curr_sess->res.wex ?
+				     human_time(TICKS_TO_MS(curr_sess->res.wex - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
 			chunk_appendf(&trash,
 				     ",ax=%s]",
-				     curr_sess->rep->analyse_exp ?
-				     human_time(TICKS_TO_MS(curr_sess->rep->analyse_exp - now_ms),
+				     curr_sess->res.analyse_exp ?
+				     human_time(TICKS_TO_MS(curr_sess->res.analyse_exp - now_ms),
 						TICKS_TO_MS(1000)) : "");
 
 			conn = objt_conn(curr_sess->si[0].end);
@@ -5685,10 +6149,11 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 
 			chunk_appendf(&trash, "\n");
 
-			if (bi_putchk(si->ib, &trash) == -1) {
-				/* let's try again later from this session. We add ourselves into
-				 * this session's users so that it can remove us upon termination.
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				/* let's try again later from this stream. We add ourselves into
+				 * this stream's users so that it can remove us upon termination.
 				 */
+				si_applet_cant_put(si);
 				LIST_ADDQ(&curr_sess->back_refs, &appctx->ctx.sess.bref.users);
 				return 0;
 			}
@@ -5698,14 +6163,16 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 		}
 
 		if (appctx->ctx.sess.target && appctx->ctx.sess.target != (void *)-1) {
-			/* specified session not found */
+			/* specified stream not found */
 			if (appctx->ctx.sess.section > 0)
 				chunk_appendf(&trash, "  *** session terminated while we were watching it ***\n");
 			else
 				chunk_appendf(&trash, "Session not found.\n");
 
-			if (bi_putchk(si->ib, &trash) == -1)
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				si_applet_cant_put(si);
 				return 0;
+			}
 
 			appctx->ctx.sess.target = NULL;
 			appctx->ctx.sess.uid = 0;
@@ -5723,21 +6190,21 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 
 /* This is called when the stream interface is closed. For instance, upon an
  * external abort, we won't call the i/o handler anymore so we may need to
- * remove back references to the session currently being dumped.
+ * remove back references to the stream currently being dumped.
  */
-static void cli_release_handler(struct stream_interface *si)
+static void cli_release_handler(struct appctx *appctx)
 {
-	struct appctx *appctx = __objt_appctx(si->end);
-
 	if (appctx->st0 == STAT_CLI_O_SESS && appctx->st2 == STAT_ST_LIST) {
 		if (!LIST_ISEMPTY(&appctx->ctx.sess.bref.users))
 			LIST_DEL(&appctx->ctx.sess.bref.users);
 	}
 	else if (appctx->st0 == STAT_CLI_PRINT_FREE) {
 		free(appctx->ctx.cli.err);
+		appctx->ctx.cli.err = NULL;
 	}
 	else if (appctx->st0 == STAT_CLI_O_MLOOK) {
 		free(appctx->ctx.map.chunk.str);
+		appctx->ctx.map.chunk.str = NULL;
 	}
 }
 
@@ -5749,7 +6216,7 @@ static void cli_release_handler(struct stream_interface *si)
 static int stats_table_request(struct stream_interface *si, int action)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
-	struct session *s = session_from_task(si->owner);
+	struct stream *s = si_strm(si);
 	struct ebmb_node *eb;
 	int dt;
 	int skip_entry;
@@ -5767,7 +6234,7 @@ static int stats_table_request(struct stream_interface *si, int action)
 	 *     data though.
 	 */
 
-	if (unlikely(si->ib->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
+	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
 		/* in case of abort, remove any refcount we might have set on an entry */
 		if (appctx->st2 == STAT_ST_LIST) {
 			appctx->ctx.table.entry->ref_cnt--;
@@ -5803,7 +6270,7 @@ static int stats_table_request(struct stream_interface *si, int action)
 					return 0;
 
 				if (appctx->ctx.table.target &&
-				    s->listener->bind_conf->level >= ACCESS_LVL_OPER) {
+				    strm_li(s)->bind_conf->level >= ACCESS_LVL_OPER) {
 					/* dump entries only if table explicitly requested */
 					eb = ebmb_first(&appctx->ctx.table.proxy->table.keys);
 					if (eb) {
@@ -5958,6 +6425,71 @@ static int dump_text_line(struct chunk *out, const char *buf, int bsize, int len
 	return ptr;
 }
 
+/* This function dumps counters from all resolvers section and associated name servers.
+ * It returns 0 if the output buffer is full and it needs
+ * to be called again, otherwise non-zero.
+ */
+static int stats_dump_resolvers_to_buffer(struct stream_interface *si)
+{
+	struct appctx *appctx = __objt_appctx(si->end);
+	struct dns_resolvers *presolvers;
+	struct dns_nameserver *pnameserver;
+
+	chunk_reset(&trash);
+
+	switch (appctx->st2) {
+	case STAT_ST_INIT:
+		appctx->st2 = STAT_ST_LIST; /* let's start producing data */
+		/* fall through */
+
+	case STAT_ST_LIST:
+		if (LIST_ISEMPTY(&dns_resolvers)) {
+			chunk_appendf(&trash, "No resolvers found\n");
+		}
+		else {
+			list_for_each_entry(presolvers, &dns_resolvers, list) {
+				if (appctx->ctx.resolvers.ptr != NULL && appctx->ctx.resolvers.ptr != presolvers)
+					continue;
+
+				chunk_appendf(&trash, "Resolvers section %s\n", presolvers->id);
+				list_for_each_entry(pnameserver, &presolvers->nameserver_list, list) {
+					chunk_appendf(&trash, " nameserver %s:\n", pnameserver->id);
+					chunk_appendf(&trash, "  sent: %ld\n", pnameserver->counters.sent);
+					chunk_appendf(&trash, "  valid: %ld\n", pnameserver->counters.valid);
+					chunk_appendf(&trash, "  update: %ld\n", pnameserver->counters.update);
+					chunk_appendf(&trash, "  cname: %ld\n", pnameserver->counters.cname);
+					chunk_appendf(&trash, "  cname_error: %ld\n", pnameserver->counters.cname_error);
+					chunk_appendf(&trash, "  any_err: %ld\n", pnameserver->counters.any_err);
+					chunk_appendf(&trash, "  nx: %ld\n", pnameserver->counters.nx);
+					chunk_appendf(&trash, "  timeout: %ld\n", pnameserver->counters.timeout);
+					chunk_appendf(&trash, "  refused: %ld\n", pnameserver->counters.refused);
+					chunk_appendf(&trash, "  other: %ld\n", pnameserver->counters.other);
+					chunk_appendf(&trash, "  invalid: %ld\n", pnameserver->counters.invalid);
+					chunk_appendf(&trash, "  too_big: %ld\n", pnameserver->counters.too_big);
+					chunk_appendf(&trash, "  truncated: %ld\n", pnameserver->counters.truncated);
+					chunk_appendf(&trash, "  outdated: %ld\n", pnameserver->counters.outdated);
+				}
+			}
+		}
+
+		/* display response */
+		if (bi_putchk(si_ic(si), &trash) == -1) {
+			/* let's try again later from this session. We add ourselves into
+			 * this session's users so that it can remove us upon termination.
+			 */
+			si->flags |= SI_FL_WAIT_ROOM;
+			return 0;
+		}
+
+		appctx->st2 = STAT_ST_FIN;
+		/* fall through */
+
+	default:
+		appctx->st2 = STAT_ST_FIN;
+		return 1;
+	}
+}
+
 /* This function dumps all captured errors onto the stream interface's
  * read buffer. It returns 0 if the output buffer is full and it needs
  * to be called again, otherwise non-zero.
@@ -5967,7 +6499,7 @@ static int stats_dump_errors_to_buffer(struct stream_interface *si)
 	struct appctx *appctx = __objt_appctx(si->end);
 	extern const char *monthname[12];
 
-	if (unlikely(si->ib->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	chunk_reset(&trash);
@@ -5984,8 +6516,9 @@ static int stats_dump_errors_to_buffer(struct stream_interface *si)
 			     tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(date.tv_usec/1000),
 			     error_snapshot_id);
 
-		if (bi_putchk(si->ib, &trash) == -1) {
+		if (bi_putchk(si_ic(si), &trash) == -1) {
 			/* Socket buffer full. Let's try again later from the same point */
+			si_applet_cant_put(si);
 			return 0;
 		}
 
@@ -6068,8 +6601,9 @@ static int stats_dump_errors_to_buffer(struct stream_interface *si)
 				     es->b_flags, es->b_out, es->b_tot,
 				     es->len, es->b_wrap, es->pos);
 
-			if (bi_putchk(si->ib, &trash) == -1) {
+			if (bi_putchk(si_ic(si), &trash) == -1) {
 				/* Socket buffer full. Let's try again later from the same point */
+				si_applet_cant_put(si);
 				return 0;
 			}
 			appctx->ctx.errors.ptr = 0;
@@ -6080,8 +6614,10 @@ static int stats_dump_errors_to_buffer(struct stream_interface *si)
 			/* the snapshot changed while we were dumping it */
 			chunk_appendf(&trash,
 				     "  WARNING! update detected on this snapshot, dump interrupted. Please re-check!\n");
-			if (bi_putchk(si->ib, &trash) == -1)
+			if (bi_putchk(si_ic(si), &trash) == -1) {
+				si_applet_cant_put(si);
 				return 0;
+			}
 			goto next;
 		}
 
@@ -6095,8 +6631,9 @@ static int stats_dump_errors_to_buffer(struct stream_interface *si)
 			if (newptr == appctx->ctx.errors.ptr)
 				return 0;
 
-			if (bi_putchk(si->ib, &trash) == -1) {
+			if (bi_putchk(si_ic(si), &trash) == -1) {
 				/* Socket buffer full. Let's try again later from the same point */
+				si_applet_cant_put(si);
 				return 0;
 			}
 			appctx->ctx.errors.ptr = newptr;
@@ -6139,14 +6676,14 @@ static int bind_parse_level(char **args, int cur_arg, struct proxy *px, struct b
 	return 0;
 }
 
-struct si_applet http_stats_applet = {
+struct applet http_stats_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<STATS>", /* used for logging */
 	.fct = http_stats_io_handler,
 	.release = NULL,
 };
 
-static struct si_applet cli_applet = {
+static struct applet cli_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<CLI>", /* used for logging */
 	.fct = cli_io_handler,

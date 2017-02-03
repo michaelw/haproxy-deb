@@ -26,8 +26,7 @@
 #include <types/global.h>
 
 #include <proto/fd.h>
-#include <proto/signal.h>
-#include <proto/task.h>
+
 
 /* private data */
 static int kqueue_fd;
@@ -84,8 +83,6 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 				}
 			}
 		}
-
-		fd_alloc_or_release_cache_entry(fd, en);
 	}
 	if (changes)
 		kevent(kqueue_fd, kev, changes, NULL, 0, NULL);
@@ -95,19 +92,17 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	timeout.tv_sec  = 0;
 	timeout.tv_nsec = 0;
 
-	if (!fd_cache_num && !run_queue && !signal_queue_len) {
-		if (!exp) {
-			delta_ms        = MAX_DELAY_MS;
-			timeout.tv_sec  = (MAX_DELAY_MS / 1000);
-			timeout.tv_nsec = (MAX_DELAY_MS % 1000) * 1000000;
-		}
-		else if (!tick_is_expired(exp, now_ms)) {
-			delta_ms = TICKS_TO_MS(tick_remain(now_ms, exp)) + 1;
-			if (delta_ms > MAX_DELAY_MS)
-				delta_ms = MAX_DELAY_MS;
-			timeout.tv_sec  = (delta_ms / 1000);
-			timeout.tv_nsec = (delta_ms % 1000) * 1000000;
-		}
+	if (!exp) {
+		delta_ms        = MAX_DELAY_MS;
+		timeout.tv_sec  = (MAX_DELAY_MS / 1000);
+		timeout.tv_nsec = (MAX_DELAY_MS % 1000) * 1000000;
+	}
+	else if (!tick_is_expired(exp, now_ms)) {
+		delta_ms = TICKS_TO_MS(tick_remain(now_ms, exp)) + 1;
+		if (delta_ms > MAX_DELAY_MS)
+			delta_ms = MAX_DELAY_MS;
+		timeout.tv_sec  = (delta_ms / 1000);
+		timeout.tv_nsec = (delta_ms % 1000) * 1000000;
 	}
 
 	fd = MIN(maxfd, global.tune.maxpollevents);
@@ -138,7 +133,11 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 				fdtab[fd].ev |= FD_POLL_OUT;
 		}
 
-		fd_process_polled_events(fd);
+		if (fdtab[fd].ev & (FD_POLL_IN | FD_POLL_HUP | FD_POLL_ERR))
+			fd_may_recv(fd);
+
+		if (fdtab[fd].ev & (FD_POLL_OUT | FD_POLL_ERR))
+			fd_may_send(fd);
 	}
 }
 

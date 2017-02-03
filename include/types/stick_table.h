@@ -31,20 +31,12 @@
 #include <eb32tree.h>
 #include <common/memory.h>
 #include <types/freq_ctr.h>
-
-/* stick table key types */
-enum {
-	STKTABLE_TYPE_IP = 0,     /* table key is ipv4 */
-	STKTABLE_TYPE_IPV6,       /* table key is ipv6 */
-	STKTABLE_TYPE_INTEGER,    /* table key is unsigned 32bit integer */
-	STKTABLE_TYPE_STRING,     /* table key is a null terminated string */
-	STKTABLE_TYPE_BINARY,     /* table key is a buffer of data  */
-	STKTABLE_TYPES            /* Number of types, must always be last */
-};
+#include <types/sample.h>
 
 /* The types of extra data we can store in a stick table */
 enum {
-	STKTABLE_DT_SERVER_ID,    /* the server ID to use with this session if > 0 */
+	STKTABLE_DT_SERVER_ID,    /* the server ID to use with this stream if > 0 */
+	STKTABLE_DT_GPT0,         /* General Purpose Flag 0. */
 	STKTABLE_DT_GPC0,         /* General Purpose Counter 0 (unsigned 32-bit integer) */
 	STKTABLE_DT_GPC0_RATE,    /* General Purpose Counter 0's event rate */
 	STKTABLE_DT_CONN_CNT,     /* cumulated number of connections */
@@ -60,7 +52,11 @@ enum {
 	STKTABLE_DT_BYTES_IN_RATE,/* bytes rate from client to servers */
 	STKTABLE_DT_BYTES_OUT_CNT,/* cumulated bytes count from servers to client */
 	STKTABLE_DT_BYTES_OUT_RATE,/* bytes rate from servers to client */
-	STKTABLE_DATA_TYPES       /* Number of data types, must always be last */
+	STKTABLE_STATIC_DATA_TYPES,/* number of types above */
+	/* up to STKTABLE_EXTRA_DATA_TYPES types may be registered here, always
+	 * followed by the number of data types, must always be last.
+	 */
+	STKTABLE_DATA_TYPES = STKTABLE_STATIC_DATA_TYPES + STKTABLE_EXTRA_DATA_TYPES
 };
 
 /* The equivalent standard types of the stored data */
@@ -88,6 +84,7 @@ union stktable_data {
 
 	/* types of each storable data */
 	int server_id;
+	unsigned int gpt0;
 	unsigned int gpc0;
 	struct freq_ctr_period gpc0_rate;
 	unsigned int conn_cnt;
@@ -150,6 +147,8 @@ struct stktable {
 	struct task *sync_task;   /* sync task */
 	unsigned int update;
 	unsigned int localupdate;
+	unsigned int commitupdate;/* used to identify the latest local updates
+				     pending for sync */
 	unsigned int syncing;     /* number of sync tasks watching this table now */
 	union {
 		struct peers *p; /* sync peers */
@@ -174,19 +173,33 @@ struct stktable {
 
 extern struct stktable_data_type stktable_data_types[STKTABLE_DATA_TYPES];
 
-/* stick table key data */
-union stktable_key_data {
-	struct in_addr ip;        /* used to store an ipv4 key */
-	struct in6_addr ipv6;     /* used to store an ipv6 key */
-	uint32_t integer;         /* used to store an integer key */
-	char buf[0];              /* dynamically allocated, used to store a null terminated string key or a buffer of data */
-};
-
 /* stick table key */
 struct stktable_key {
 	void *key;                      /* pointer on key buffer */
 	size_t key_len;                 /* data len to read in buff in case of null terminated string */
-	union stktable_key_data data;   /* data, must always be last */
+};
+
+/* WARNING: if new fields are added, they must be initialized in stream_accept()
+ * and freed in stream_free() !
+ */
+#define STKCTR_TRACK_BACKEND 1
+#define STKCTR_TRACK_CONTENT 2
+
+/* stick counter. The <entry> member is a composite address (caddr) made of a
+ * pointer to an stksess struct, and two flags among STKCTR_TRACK_* above.
+ */
+struct stkctr {
+	unsigned long   entry;          /* entry containing counters currently being tracked by this stream  */
+	struct stktable *table;         /* table the counters above belong to (undefined if counters are null) */
+};
+
+/* parameters to configure tracked counters */
+struct track_ctr_prm {
+	struct sample_expr *expr;		/* expression used as the key */
+	union {
+		struct stktable *t;		/* a pointer to the table */
+		char *n;			/* or its name during parsing. */
+	} table;
 };
 
 #endif /* _TYPES_STICK_TABLE_H */

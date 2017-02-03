@@ -218,11 +218,14 @@ check_user(struct userlist *ul, const char *user, const char *pass)
 {
 
 	struct auth_users *u;
+#ifdef DEBUG_AUTH
+	struct auth_groups_list *agl;
+#endif
 	const char *ep;
 
 #ifdef DEBUG_AUTH
-	fprintf(stderr, "req: userlist=%s, user=%s, pass=%s, group=%s\n",
-		ul->name, user, pass, group);
+	fprintf(stderr, "req: userlist=%s, user=%s, pass=%s\n",
+	        ul->name, user, pass);
 #endif
 
 	for (u = ul->users; u; u = u->next)
@@ -273,7 +276,7 @@ pat_match_auth(struct sample *smp, struct pattern_expr *expr, int fill)
 
 	/* Browse the userlist for searching user. */
 	for (u = ul->users; u; u = u->next) {
-		if (strcmp(smp->data.str.str, u->user) == 0)
+		if (strcmp(smp->data.u.str.str, u->user) == 0)
 			break;
 	}
 	if (!u)

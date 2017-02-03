@@ -22,13 +22,13 @@
 #ifndef _COMMON_COMPAT_H
 #define _COMMON_COMPAT_H
 
+#include <limits.h>
 /* This is needed on Linux for Netfilter includes */
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <common/config.h>
-#include <common/standard.h>
+#include <netinet/in.h>
 
 #ifndef BITS_PER_INT
 #define BITS_PER_INT    (8*sizeof(int))
@@ -127,6 +127,11 @@
 #ifndef TCP_FASTOPEN
 #define TCP_FASTOPEN 23
 #endif
+#endif
+
+/* FreeBSD doesn't define SOL_IP and prefers IPPROTO_IP */
+#ifndef SOL_IP
+#define SOL_IP IPPROTO_IP
 #endif
 
 /* If IPv6 is supported, define IN6_IS_ADDR_V4MAPPED() if missing. */
